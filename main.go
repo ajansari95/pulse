@@ -827,14 +827,16 @@ func (m *Monitor) SendDailySummary() {
 }
 
 func (m *Monitor) SendWeeklySummary() {
-	message := m.buildSummaryMessage("Weekly", m.weeklyMetrics)
-	if message == "" {
-		return
-	}
-	m.SendAlert(message)
 	m.mu.Lock()
-	m.resetMetrics(m.weeklyMetrics)
+	message := m.buildSummaryMessage("Weekly", m.weeklyMetrics)
+	if message != "" {
+		m.resetMetrics(m.weeklyMetrics)
+	}
 	m.mu.Unlock()
+	if message != "" {
+		m.SendAlert(message)
+	}
+}
 }
 
 func (m *Monitor) PollTelegramCommands(ctx context.Context) {

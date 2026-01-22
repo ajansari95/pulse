@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"html/template"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +26,9 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"gopkg.in/yaml.v3"
 )
+
+//go:embed static/* templates/*
+var dashboardFS embed.FS
 
 type Config struct {
 	Telegram struct {
@@ -47,6 +54,7 @@ type Config struct {
 		Timeout          string `yaml:"timeout" json:"timeout"`
 		DailySummary     string `yaml:"daily_summary" json:"daily_summary"`
 		WeeklySummary    string `yaml:"weekly_summary" json:"weekly_summary"`
+		PublicDashboard  *bool  `yaml:"public_dashboard" json:"public_dashboard"`
 	} `yaml:"settings" json:"settings"`
 	Endpoints []Endpoint `yaml:"endpoints" json:"endpoints"`
 }
@@ -113,6 +121,19 @@ type EndpointMetrics struct {
 	ActiveDowntimeFrom time.Time
 }
 
+type HistoryPoint struct {
+	Timestamp      time.Time `json:"timestamp"`
+	ResponseTimeMs int64     `json:"response_time_ms"`
+	Up             bool      `json:"up"`
+}
+
+type IncidentEvent struct {
+	Endpoint string     `json:"endpoint"`
+	Start    time.Time  `json:"start"`
+	End      *time.Time `json:"end,omitempty"`
+	Error    string     `json:"error"`
+}
+
 type Monitor struct {
 	config           Config
 	checkInterval    time.Duration
@@ -122,6 +143,10 @@ type Monitor struct {
 	statuses         map[string]*EndpointStatus
 	dailyMetrics     map[string]*EndpointMetrics
 	weeklyMetrics    map[string]*EndpointMetrics
+	history          map[string][]HistoryPoint
+	incidents        []IncidentEvent
+	activeIncidents  map[string]int
+	historyLimit     int
 	alertClient      *http.Client
 	mu               sync.RWMutex
 }
@@ -154,6 +179,11 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("PORT"); v != "" {
 		c.Settings.Port = v
 	}
+	if v := os.Getenv("PUBLIC_DASHBOARD"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			c.Settings.PublicDashboard = &parsed
+		}
+	}
 }
 
 func NewMonitor(config Config) *Monitor {
@@ -183,6 +213,10 @@ func NewMonitor(config Config) *Monitor {
 		statuses:         make(map[string]*EndpointStatus),
 		dailyMetrics:     make(map[string]*EndpointMetrics),
 		weeklyMetrics:    make(map[string]*EndpointMetrics),
+		history:          make(map[string][]HistoryPoint),
+		incidents:        []IncidentEvent{},
+		activeIncidents:  make(map[string]int),
+		historyLimit:     500,
 		alertClient:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -720,6 +754,9 @@ func (m *Monitor) ensureMetrics(ep Endpoint) {
 	if _, ok := m.weeklyMetrics[ep.Name]; !ok {
 		m.weeklyMetrics[ep.Name] = &EndpointMetrics{}
 	}
+	if _, ok := m.history[ep.Name]; !ok {
+		m.history[ep.Name] = []HistoryPoint{}
+	}
 }
 
 func (m *Monitor) recordCheckMetrics(metrics *EndpointMetrics, isUp bool, responseTime time.Duration) {
@@ -870,6 +907,133 @@ func (m *Monitor) resetMetrics(metrics map[string]*EndpointMetrics) {
 	}
 }
 
+func (m *Monitor) recordHistory(ep Endpoint, now time.Time, responseTime time.Duration, isUp bool) {
+	points := m.history[ep.Name]
+	points = append(points, HistoryPoint{
+		Timestamp:      now,
+		ResponseTimeMs: responseTime.Milliseconds(),
+		Up:             isUp,
+	})
+	if len(points) > m.historyLimit {
+		points = points[len(points)-m.historyLimit:]
+	}
+	m.history[ep.Name] = points
+}
+
+func (m *Monitor) startIncident(ep Endpoint, start time.Time, errMsg string) {
+	if _, exists := m.activeIncidents[ep.Name]; exists {
+		return
+	}
+	incident := IncidentEvent{
+		Endpoint: ep.Name,
+		Start:    start,
+		Error:    errMsg,
+	}
+	m.incidents = append(m.incidents, incident)
+	m.activeIncidents[ep.Name] = len(m.incidents) - 1
+}
+
+func (m *Monitor) resolveIncident(ep Endpoint, end time.Time) {
+	index, ok := m.activeIncidents[ep.Name]
+	if !ok || index < 0 || index >= len(m.incidents) {
+		return
+	}
+	m.incidents[index].End = &end
+	delete(m.activeIncidents, ep.Name)
+}
+
+type DashboardSummary struct {
+	GeneratedAt time.Time        `json:"generated_at"`
+	Endpoints   []EndpointReport `json:"endpoints"`
+}
+
+type EndpointReport struct {
+	Name              string    `json:"name"`
+	DisplayURL        string    `json:"display_url"`
+	Up                bool      `json:"up"`
+	ResponseTimeMs    int64     `json:"response_time_ms"`
+	LastCheck         time.Time `json:"last_check"`
+	LastError         string    `json:"last_error"`
+	UptimePercent     float64   `json:"uptime_percent"`
+	AvgResponseTimeMs int64     `json:"avg_response_time_ms"`
+	Incidents         int       `json:"incidents"`
+	LongestDowntimeMs int64     `json:"longest_downtime_ms"`
+}
+
+type DashboardHistory struct {
+	GeneratedAt time.Time                 `json:"generated_at"`
+	History     map[string][]HistoryPoint `json:"history"`
+	Incidents   []IncidentEvent           `json:"incidents"`
+}
+
+func (m *Monitor) DashboardSummaryHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+
+		reports := make([]EndpointReport, 0, len(m.config.Endpoints))
+		for _, ep := range m.config.Endpoints {
+			status := m.statuses[ep.Name]
+			metrics := m.dailyMetrics[ep.Name]
+			if metrics == nil {
+				metrics = &EndpointMetrics{}
+			}
+			uptime := 0.0
+			if metrics.TotalChecks > 0 {
+				uptime = (float64(metrics.UpChecks) / float64(metrics.TotalChecks)) * 100
+			}
+			avgResponse := int64(0)
+			if metrics.ResponseSamples > 0 {
+				avgResponse = (metrics.TotalResponseTime / time.Duration(metrics.ResponseSamples)).Milliseconds()
+			}
+			longest := metrics.LongestDowntime.Milliseconds()
+			reports = append(reports, EndpointReport{
+				Name:              ep.Name,
+				DisplayURL:        m.getDisplayURL(ep),
+				Up:                status != nil && status.IsUp,
+				ResponseTimeMs:    status.ResponseTime.Milliseconds(),
+				LastCheck:         status.LastCheck,
+				LastError:         status.LastError,
+				UptimePercent:     uptime,
+				AvgResponseTimeMs: avgResponse,
+				Incidents:         metrics.Incidents,
+				LongestDowntimeMs: longest,
+			})
+		}
+
+		payload := DashboardSummary{
+			GeneratedAt: time.Now(),
+			Endpoints:   reports,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(payload)
+	}
+}
+
+func (m *Monitor) DashboardHistoryHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+
+		historyCopy := make(map[string][]HistoryPoint, len(m.history))
+		for name, points := range m.history {
+			copyPoints := make([]HistoryPoint, len(points))
+			copy(copyPoints, points)
+			historyCopy[name] = copyPoints
+		}
+		incidentsCopy := make([]IncidentEvent, len(m.incidents))
+		copy(incidentsCopy, m.incidents)
+
+		payload := DashboardHistory{
+			GeneratedAt: time.Now(),
+			History:     historyCopy,
+			Incidents:   incidentsCopy,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(payload)
+	}
+}
+
 func parseClock(value string) (int, int, bool) {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
@@ -997,7 +1161,6 @@ func (m *Monitor) SendWeeklySummary() {
 		m.SendAlert(message)
 	}
 }
-}
 
 func (m *Monitor) PollTelegramCommands(ctx context.Context) {
 	if m.config.Telegram.BotToken == "" {
@@ -1111,6 +1274,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 			}
 			m.recordCheckMetrics(dailyMetrics, isUp, responseTime)
 			m.recordCheckMetrics(weeklyMetrics, isUp, responseTime)
+			m.recordHistory(ep, now, responseTime, isUp)
 
 			if isUp {
 				status.LastError = ""
@@ -1126,6 +1290,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 						m.recordIncidentEnd(dailyMetrics, now)
 						m.recordIncidentEnd(weeklyMetrics, now)
 					}
+					m.resolveIncident(ep, now)
 					status.DownSince = time.Time{}
 					status.Consecutive = 1
 					m.mu.Unlock()
@@ -1156,6 +1321,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					status.DownSince = now
 					m.recordIncidentStart(dailyMetrics, now)
 					m.recordIncidentStart(weeklyMetrics, now)
+					m.startIncident(ep, now, errMsg)
 					m.mu.Unlock()
 					m.SendAlert(fmt.Sprintf("🔴 <b>%s</b> is DOWN\n\nEndpoint: <code>%s</code>\nError: %s",
 						ep.Name, displayURL, errMsg))
@@ -1218,6 +1384,30 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", monitor.HealthHandler())
 	mux.HandleFunc("/status", monitor.HealthHandler())
+
+	publicDashboard := true
+	if config.Settings.PublicDashboard != nil {
+		publicDashboard = *config.Settings.PublicDashboard
+	}
+	if publicDashboard {
+		tmpl := template.Must(template.ParseFS(dashboardFS, "templates/index.html"))
+		staticFS, err := fs.Sub(dashboardFS, "static")
+		if err != nil {
+			log.Fatalf("Failed to load dashboard assets: %v", err)
+		}
+		mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+		mux.HandleFunc("/api/summary", monitor.DashboardSummaryHandler())
+		mux.HandleFunc("/api/history", monitor.DashboardHistoryHandler())
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" && r.URL.Path != "/dashboard" {
+				http.NotFound(w, r)
+				return
+			}
+			if err := tmpl.Execute(w, nil); err != nil {
+				log.Printf("Failed to render dashboard: %v", err)
+			}
+		})
+	}
 	server := &http.Server{Addr: ":" + port, Handler: mux}
 
 	ctx, cancel := context.WithCancel(context.Background())

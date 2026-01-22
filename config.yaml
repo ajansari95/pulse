@@ -67,6 +67,13 @@ endpoints:
     skip_tls_verify: true
     timeout: "5s"
 
+  # SSL certificate expiry check
+  - name: "API SSL"
+    url: "https://api.example.com"
+    type: "ssl"
+    warn_days: 30
+    critical_days: 7
+
   # JSON-RPC (Ethereum)
   - name: "Ethereum RPC"
     url: "https://eth.example.com"

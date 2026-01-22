@@ -219,6 +219,19 @@ API endpoints:
 
 Pulse can also send alerts to Slack, Discord, and PagerDuty. Configure the webhook URLs or routing key under `notifications` in your config.
 
+## SSL Certificate Monitoring
+
+Monitor certificate expiry with a dedicated `ssl` endpoint type:
+
+```yaml
+endpoints:
+  - name: "API SSL"
+    url: "https://api.example.com"
+    type: "ssl"
+    warn_days: 30
+    critical_days: 7
+```
+
 ## Endpoint Types
 
 | Type | Check Method |
@@ -229,6 +242,7 @@ Pulse can also send alerts to Slack, Discord, and PagerDuty. Configure the webho
 | `grpc` | gRPC health check |
 | `port` / `tcp` | TCP connection |
 | `websocket` | TCP connection to WS endpoint |
+| `ssl` | TLS certificate expiry check |
 
 ## Telegram Setup
 

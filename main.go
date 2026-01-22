@@ -80,13 +80,14 @@ type BasicAuth struct {
 }
 
 type EndpointStatus struct {
-	Endpoint     Endpoint
-	IsUp         bool
-	LastCheck    time.Time
-	LastError    string
-	ResponseTime time.Duration
-	Consecutive  int
-	DownSince    time.Time
+	Endpoint       Endpoint
+	IsUp           bool
+	LastCheck      time.Time
+	LastError      string
+	ResponseTime   time.Duration
+	Consecutive    int
+	DownSince      time.Time
+	ConsecFailures int
 }
 
 type Monitor struct {
@@ -684,6 +685,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 
 			if isUp {
 				status.LastError = ""
+				status.ConsecFailures = 0
 				if m.slowThreshold > 0 && responseTime > m.slowThreshold && (status.Consecutive == 0 || wasUp) {
 					m.mu.Unlock()
 					m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
@@ -708,12 +710,8 @@ func (m *Monitor) checkAll(ctx context.Context) {
 				log.Printf("✓ %s UP (%v)", ep.Name, responseTime.Round(time.Millisecond))
 			} else {
 				status.LastError = errMsg
-				if wasUp {
-					status.Consecutive = 1
-				} else {
-					status.Consecutive++
-				}
-				if status.Consecutive == m.failureThreshold {
+				status.ConsecFailures++
+				if status.ConsecFailures == m.failureThreshold && status.IsUp {
 					status.IsUp = false
 					status.DownSince = time.Now()
 					m.mu.Unlock()
@@ -721,8 +719,8 @@ func (m *Monitor) checkAll(ctx context.Context) {
 						ep.Name, displayURL, errMsg))
 				} else {
 					m.mu.Unlock()
-					if status.Consecutive < m.failureThreshold {
-						log.Printf("⚠ %s failed (%d/%d): %s", ep.Name, status.Consecutive, m.failureThreshold, errMsg)
+					if status.ConsecFailures < m.failureThreshold {
+						log.Printf("⚠ %s failed (%d/%d): %s", ep.Name, status.ConsecFailures, m.failureThreshold, errMsg)
 						return
 					}
 				}

@@ -34,6 +34,8 @@ type Config struct {
 		SlowThreshold    string `yaml:"slow_threshold" json:"slow_threshold"`
 		Port             string `yaml:"port" json:"port"`
 		Timeout          string `yaml:"timeout" json:"timeout"`
+		DailySummary     string `yaml:"daily_summary" json:"daily_summary"`
+		WeeklySummary    string `yaml:"weekly_summary" json:"weekly_summary"`
 	} `yaml:"settings" json:"settings"`
 	Endpoints []Endpoint `yaml:"endpoints" json:"endpoints"`
 }
@@ -90,6 +92,16 @@ type EndpointStatus struct {
 	ConsecFailures int
 }
 
+type EndpointMetrics struct {
+	TotalChecks        int
+	UpChecks           int
+	TotalResponseTime  time.Duration
+	ResponseSamples    int
+	Incidents          int
+	LongestDowntime    time.Duration
+	ActiveDowntimeFrom time.Time
+}
+
 type Monitor struct {
 	config           Config
 	checkInterval    time.Duration
@@ -97,6 +109,8 @@ type Monitor struct {
 	slowThreshold    time.Duration
 	defaultTimeout   time.Duration
 	statuses         map[string]*EndpointStatus
+	dailyMetrics     map[string]*EndpointMetrics
+	weeklyMetrics    map[string]*EndpointMetrics
 	mu               sync.RWMutex
 }
 
@@ -155,6 +169,8 @@ func NewMonitor(config Config) *Monitor {
 		slowThreshold:    slowThreshold,
 		defaultTimeout:   defaultTimeout,
 		statuses:         make(map[string]*EndpointStatus),
+		dailyMetrics:     make(map[string]*EndpointMetrics),
+		weeklyMetrics:    make(map[string]*EndpointMetrics),
 	}
 }
 
@@ -542,6 +558,40 @@ func (m *Monitor) SendAlert(message string) {
 	}
 }
 
+func (m *Monitor) ensureMetrics(ep Endpoint) {
+	if _, ok := m.dailyMetrics[ep.Name]; !ok {
+		m.dailyMetrics[ep.Name] = &EndpointMetrics{}
+	}
+	if _, ok := m.weeklyMetrics[ep.Name]; !ok {
+		m.weeklyMetrics[ep.Name] = &EndpointMetrics{}
+	}
+}
+
+func (m *Monitor) recordCheckMetrics(metrics *EndpointMetrics, isUp bool, responseTime time.Duration) {
+	metrics.TotalChecks++
+	if isUp {
+		metrics.UpChecks++
+		metrics.TotalResponseTime += responseTime
+		metrics.ResponseSamples++
+	}
+}
+
+func (m *Monitor) recordIncidentStart(metrics *EndpointMetrics, start time.Time) {
+	metrics.Incidents++
+	metrics.ActiveDowntimeFrom = start
+}
+
+func (m *Monitor) recordIncidentEnd(metrics *EndpointMetrics, end time.Time) {
+	if metrics.ActiveDowntimeFrom.IsZero() {
+		return
+	}
+	downtime := end.Sub(metrics.ActiveDowntimeFrom)
+	if downtime > metrics.LongestDowntime {
+		metrics.LongestDowntime = downtime
+	}
+	metrics.ActiveDowntimeFrom = time.Time{}
+}
+
 func (m *Monitor) getDisplayURL(ep Endpoint) string {
 	if ep.DisplayURL != "" {
 		return ep.DisplayURL
@@ -580,6 +630,210 @@ func (m *Monitor) GenerateStatusMessage() string {
 	}
 	msg += fmt.Sprintf("Last check: %s", time.Now().Format("15:04:05 MST"))
 	return msg
+}
+
+func formatDuration(duration time.Duration) string {
+	if duration <= 0 {
+		return "0s"
+	}
+	if duration < time.Second {
+		return duration.Round(time.Millisecond).String()
+	}
+	return duration.Round(time.Second).String()
+}
+
+func (m *Monitor) buildSummaryMessage(label string, metrics map[string]*EndpointMetrics) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if len(m.statuses) == 0 {
+		return ""
+	}
+
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "📊 <b>%s Summary</b>\n\n", label)
+	for _, ep := range m.config.Endpoints {
+		status := m.statuses[ep.Name]
+		metric := metrics[ep.Name]
+		if metric == nil {
+			metric = &EndpointMetrics{}
+		}
+
+		uptime := 0.0
+		if metric.TotalChecks > 0 {
+			uptime = (float64(metric.UpChecks) / float64(metric.TotalChecks)) * 100
+		}
+
+		avgResponse := "n/a"
+		if metric.ResponseSamples > 0 {
+			avg := metric.TotalResponseTime / time.Duration(metric.ResponseSamples)
+			avgResponse = avg.Round(time.Millisecond).String()
+		}
+
+		longestDowntime := metric.LongestDowntime
+		if !metric.ActiveDowntimeFrom.IsZero() {
+			current := time.Since(metric.ActiveDowntimeFrom)
+			if current > longestDowntime {
+				longestDowntime = current
+			}
+		}
+		if status != nil && !status.DownSince.IsZero() && metric.ActiveDowntimeFrom.IsZero() {
+			current := time.Since(status.DownSince)
+			if current > longestDowntime {
+				longestDowntime = current
+			}
+		}
+
+		icon := "✅"
+		if status != nil && !status.IsUp {
+			icon = "🔴"
+		}
+
+		fmt.Fprintf(&builder, "%s <b>%s</b>\n", icon, ep.Name)
+		fmt.Fprintf(&builder, "Uptime: <code>%.2f%%</code>\n", uptime)
+		fmt.Fprintf(&builder, "Avg response: <code>%s</code>\n", avgResponse)
+		fmt.Fprintf(&builder, "Incidents: <code>%d</code>\n", metric.Incidents)
+		fmt.Fprintf(&builder, "Longest downtime: <code>%s</code>\n\n", formatDuration(longestDowntime))
+	}
+
+	fmt.Fprintf(&builder, "Report generated: %s", time.Now().Format("2006-01-02 15:04 MST"))
+	return builder.String()
+}
+
+func (m *Monitor) resetMetrics(metrics map[string]*EndpointMetrics) {
+	for name, metric := range metrics {
+		*metric = EndpointMetrics{}
+		status := m.statuses[name]
+		if status != nil && !status.IsUp {
+			metric.ActiveDowntimeFrom = time.Now()
+		}
+	}
+}
+
+func parseClock(value string) (int, int, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, 0, false
+	}
+	parsed, err := time.Parse("15:04", trimmed)
+	if err != nil {
+		return 0, 0, false
+	}
+	return parsed.Hour(), parsed.Minute(), true
+}
+
+func parseWeeklySchedule(value string) (time.Weekday, int, int, bool) {
+	parts := strings.Fields(strings.ToLower(strings.TrimSpace(value)))
+	if len(parts) != 2 {
+		return time.Sunday, 0, 0, false
+	}
+	weekday, ok := map[string]time.Weekday{
+		"sunday":    time.Sunday,
+		"monday":    time.Monday,
+		"tuesday":   time.Tuesday,
+		"wednesday": time.Wednesday,
+		"thursday":  time.Thursday,
+		"friday":    time.Friday,
+		"saturday":  time.Saturday,
+	}[parts[0]]
+	if !ok {
+		return time.Sunday, 0, 0, false
+	}
+	hour, minute, ok := parseClock(parts[1])
+	if !ok {
+		return time.Sunday, 0, 0, false
+	}
+	return weekday, hour, minute, true
+}
+
+func nextDailyRun(now time.Time, hour, minute int) time.Time {
+	start := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	if !start.After(now) {
+		start = start.Add(24 * time.Hour)
+	}
+	return start
+}
+
+func nextWeeklyRun(now time.Time, weekday time.Weekday, hour, minute int) time.Time {
+	start := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	daysUntil := (int(weekday) - int(now.Weekday()) + 7) % 7
+	if daysUntil == 0 && !start.After(now) {
+		daysUntil = 7
+	}
+	if daysUntil > 0 {
+		start = start.AddDate(0, 0, daysUntil)
+	}
+	return start
+}
+
+func (m *Monitor) runDailySummary(ctx context.Context, hour, minute int) {
+	for {
+		nextRun := nextDailyRun(time.Now(), hour, minute)
+		timer := time.NewTimer(time.Until(nextRun))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			m.SendDailySummary()
+		}
+	}
+}
+
+func (m *Monitor) runWeeklySummary(ctx context.Context, weekday time.Weekday, hour, minute int) {
+	for {
+		nextRun := nextWeeklyRun(time.Now(), weekday, hour, minute)
+		timer := time.NewTimer(time.Until(nextRun))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			m.SendWeeklySummary()
+		}
+	}
+}
+
+func (m *Monitor) ScheduleSummaryReports(ctx context.Context) {
+	dailySetting := strings.TrimSpace(m.config.Settings.DailySummary)
+	if dailySetting != "" {
+		if hour, minute, ok := parseClock(dailySetting); ok {
+			go m.runDailySummary(ctx, hour, minute)
+		} else {
+			log.Printf("Invalid daily_summary format: %s (expected HH:MM)", dailySetting)
+		}
+	}
+
+	weeklySetting := strings.TrimSpace(m.config.Settings.WeeklySummary)
+	if weeklySetting != "" {
+		if weekday, hour, minute, ok := parseWeeklySchedule(weeklySetting); ok {
+			go m.runWeeklySummary(ctx, weekday, hour, minute)
+		} else {
+			log.Printf("Invalid weekly_summary format: %s (expected 'monday HH:MM')", weeklySetting)
+		}
+	}
+}
+
+func (m *Monitor) SendDailySummary() {
+	message := m.buildSummaryMessage("Daily", m.dailyMetrics)
+	if message == "" {
+		return
+	}
+	m.SendAlert(message)
+	m.mu.Lock()
+	m.resetMetrics(m.dailyMetrics)
+	m.mu.Unlock()
+}
+
+func (m *Monitor) SendWeeklySummary() {
+	message := m.buildSummaryMessage("Weekly", m.weeklyMetrics)
+	if message == "" {
+		return
+	}
+	m.SendAlert(message)
+	m.mu.Lock()
+	m.resetMetrics(m.weeklyMetrics)
+	m.mu.Unlock()
 }
 
 func (m *Monitor) PollTelegramCommands(ctx context.Context) {
@@ -640,6 +894,7 @@ func (m *Monitor) PollTelegramCommands(ctx context.Context) {
 func (m *Monitor) Run(ctx context.Context) {
 	for _, ep := range m.config.Endpoints {
 		m.statuses[ep.Name] = &EndpointStatus{Endpoint: ep, IsUp: true}
+		m.ensureMetrics(ep)
 	}
 
 	m.checkAll(ctx)
@@ -676,36 +931,58 @@ func (m *Monitor) checkAll(ctx context.Context) {
 
 			isUp, errMsg, responseTime := m.CheckEndpoint(checkCtx, ep)
 			displayURL := m.getDisplayURL(ep)
+			now := time.Now()
 
 			m.mu.Lock()
 			status := m.statuses[ep.Name]
 			wasUp := status.IsUp
-			status.LastCheck = time.Now()
+			status.LastCheck = now
 			status.ResponseTime = responseTime
+
+			dailyMetrics := m.dailyMetrics[ep.Name]
+			weeklyMetrics := m.weeklyMetrics[ep.Name]
+			if dailyMetrics == nil || weeklyMetrics == nil {
+				m.ensureMetrics(ep)
+				dailyMetrics = m.dailyMetrics[ep.Name]
+				weeklyMetrics = m.weeklyMetrics[ep.Name]
+			}
+			m.recordCheckMetrics(dailyMetrics, isUp, responseTime)
+			m.recordCheckMetrics(weeklyMetrics, isUp, responseTime)
 
 			if isUp {
 				status.LastError = ""
 				status.ConsecFailures = 0
-				if m.slowThreshold > 0 && responseTime > m.slowThreshold && (status.Consecutive == 0 || wasUp) {
-					m.mu.Unlock()
-					m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
-						ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
-					m.mu.Lock()
-				}
+				sendSlowAlert := m.slowThreshold > 0 && responseTime > m.slowThreshold && (status.Consecutive == 0 || wasUp)
 				if !wasUp {
 					status.IsUp = true
-					downDuration := ""
+					downDuration := time.Duration(0)
 					if !status.DownSince.IsZero() {
-						downDuration = fmt.Sprintf("\nDowntime: %v", time.Since(status.DownSince).Round(time.Second))
+						downDuration = now.Sub(status.DownSince)
+					}
+					if downDuration > 0 {
+						m.recordIncidentEnd(dailyMetrics, now)
+						m.recordIncidentEnd(weeklyMetrics, now)
 					}
 					status.DownSince = time.Time{}
 					status.Consecutive = 1
 					m.mu.Unlock()
+					if sendSlowAlert {
+						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
+							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
+					}
+					downMsg := ""
+					if downDuration > 0 {
+						downMsg = fmt.Sprintf("\nDowntime: %v", downDuration.Round(time.Second))
+					}
 					m.SendAlert(fmt.Sprintf("✅ <b>%s</b> is UP\n\nEndpoint: <code>%s</code>\nResponse: %v%s",
-						ep.Name, displayURL, responseTime.Round(time.Millisecond), downDuration))
+						ep.Name, displayURL, responseTime.Round(time.Millisecond), downMsg))
 				} else {
 					status.Consecutive++
 					m.mu.Unlock()
+					if sendSlowAlert {
+						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
+							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
+					}
 				}
 				log.Printf("✓ %s UP (%v)", ep.Name, responseTime.Round(time.Millisecond))
 			} else {
@@ -713,7 +990,9 @@ func (m *Monitor) checkAll(ctx context.Context) {
 				status.ConsecFailures++
 				if status.ConsecFailures == m.failureThreshold && status.IsUp {
 					status.IsUp = false
-					status.DownSince = time.Now()
+					status.DownSince = now
+					m.recordIncidentStart(dailyMetrics, now)
+					m.recordIncidentStart(weeklyMetrics, now)
 					m.mu.Unlock()
 					m.SendAlert(fmt.Sprintf("🔴 <b>%s</b> is DOWN\n\nEndpoint: <code>%s</code>\nError: %s",
 						ep.Name, displayURL, errMsg))
@@ -792,6 +1071,7 @@ func main() {
 
 	go monitor.Run(ctx)
 	go monitor.PollTelegramCommands(ctx)
+	go monitor.ScheduleSummaryReports(ctx)
 
 	startupMsg := fmt.Sprintf("🚀 <b>Pulse Monitor Started</b>\n\n%d endpoints, interval: %s\n\n", len(config.Endpoints), monitor.checkInterval)
 	for _, ep := range config.Endpoints {

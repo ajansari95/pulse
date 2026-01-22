@@ -75,6 +75,10 @@ settings:
   daily_summary: "09:00"     # Daily summary time (local)
   weekly_summary: "monday 09:00" # Weekly summary schedule (local)
   public_dashboard: true      # Enable the web dashboard
+  region: "us-east-1"         # Region name for multi-region checks
+  coordinator_url: ""         # Coordinator URL (agent mode)
+  regions_required: 2         # Minimum regions to alert
+  region_alerts: false        # Coordinator sends per-region alerts
 ```
 
 ### Maintenance Windows
@@ -212,6 +216,10 @@ Override settings via env:
 - `PORT`
 - `METRICS_PORT`
 - `PUBLIC_DASHBOARD`
+- `REGION`
+- `COORDINATOR_URL`
+- `REGIONS_REQUIRED`
+- `REGION_ALERTS`
 
 ## Prometheus Metrics
 
@@ -224,6 +232,25 @@ The dashboard is served at `/` and `/dashboard` when enabled. It provides real-t
 API endpoints:
 - `/api/summary` for status and aggregate metrics
 - `/api/history` for response history and incidents
+
+## Multi-Region Checks
+
+Run multiple Pulse agents and point them at a coordinator for aggregated alerting.
+
+Coordinator:
+```yaml
+settings:
+  region: "coordinator"
+  regions_required: 2
+  region_alerts: true
+```
+
+Agent:
+```yaml
+settings:
+  region: "us-east-1"
+  coordinator_url: "http://coordinator:8080"
+```
 
 ## Webhook Notifications
 

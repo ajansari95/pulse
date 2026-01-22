@@ -58,6 +58,10 @@ type Config struct {
 		DailySummary     string `yaml:"daily_summary" json:"daily_summary"`
 		WeeklySummary    string `yaml:"weekly_summary" json:"weekly_summary"`
 		PublicDashboard  *bool  `yaml:"public_dashboard" json:"public_dashboard"`
+		Region           string `yaml:"region" json:"region"`
+		CoordinatorURL   string `yaml:"coordinator_url" json:"coordinator_url"`
+		RegionsRequired  int    `yaml:"regions_required" json:"regions_required"`
+		RegionAlerts     bool   `yaml:"region_alerts" json:"region_alerts"`
 	} `yaml:"settings" json:"settings"`
 	Endpoints   []Endpoint          `yaml:"endpoints" json:"endpoints"`
 	Maintenance []MaintenanceWindow `yaml:"maintenance" json:"maintenance"`
@@ -149,6 +153,18 @@ type IncidentEvent struct {
 	Error    string     `json:"error"`
 }
 
+type RegionStatus struct {
+	Up             bool      `json:"up"`
+	LastCheck      time.Time `json:"last_check"`
+	LastError      string    `json:"last_error"`
+	ResponseTimeMs int64     `json:"response_time_ms"`
+}
+
+type RegionReport struct {
+	Region   string                  `json:"region"`
+	Statuses map[string]RegionStatus `json:"statuses"`
+}
+
 type Monitor struct {
 	config           Config
 	checkInterval    time.Duration
@@ -169,6 +185,12 @@ type Monitor struct {
 	mutes            map[string]time.Time
 	acknowledged     map[string]time.Time
 	maintenanceUntil map[string]time.Time
+	region           string
+	coordinatorURL   string
+	regionsRequired  int
+	regionAlerts     bool
+	regionReports    map[string]map[string]RegionStatus
+	aggregateStatus  map[string]bool
 	alertClient      *http.Client
 	mu               sync.RWMutex
 }
@@ -204,6 +226,22 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("METRICS_PORT"); v != "" {
 		c.Settings.MetricsPort = v
 	}
+	if v := os.Getenv("REGION"); v != "" {
+		c.Settings.Region = v
+	}
+	if v := os.Getenv("COORDINATOR_URL"); v != "" {
+		c.Settings.CoordinatorURL = v
+	}
+	if v := os.Getenv("REGIONS_REQUIRED"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			c.Settings.RegionsRequired = parsed
+		}
+	}
+	if v := os.Getenv("REGION_ALERTS"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			c.Settings.RegionAlerts = parsed
+		}
+	}
 	if v := os.Getenv("PUBLIC_DASHBOARD"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.Settings.PublicDashboard = &parsed
@@ -229,6 +267,15 @@ func NewMonitor(config Config) *Monitor {
 		defaultTimeout = 10 * time.Second
 	}
 
+	region := strings.TrimSpace(config.Settings.Region)
+	if region == "" {
+		region = "default"
+	}
+	regionsRequired := config.Settings.RegionsRequired
+	if regionsRequired == 0 {
+		regionsRequired = 2
+	}
+
 	return &Monitor{
 		config:           config,
 		checkInterval:    checkInterval,
@@ -249,6 +296,12 @@ func NewMonitor(config Config) *Monitor {
 		mutes:            make(map[string]time.Time),
 		acknowledged:     make(map[string]time.Time),
 		maintenanceUntil: make(map[string]time.Time),
+		region:           region,
+		coordinatorURL:   strings.TrimSpace(config.Settings.CoordinatorURL),
+		regionsRequired:  regionsRequired,
+		regionAlerts:     config.Settings.RegionAlerts,
+		regionReports:    make(map[string]map[string]RegionStatus),
+		aggregateStatus:  make(map[string]bool),
 		alertClient:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -1590,6 +1643,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 			isUp, errMsg, responseTime := m.CheckEndpoint(checkCtx, ep)
 			displayURL := m.getDisplayURL(ep)
 			now := time.Now()
+			sendLocalAlerts := m.coordinatorURL == ""
 
 			m.mu.Lock()
 			status := m.statuses[ep.Name]
@@ -1654,7 +1708,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					status.DownSince = time.Time{}
 					status.Consecutive = 1
 					m.mu.Unlock()
-					if shouldAlert && sendSlowAlert {
+					if sendLocalAlerts && shouldAlert && sendSlowAlert {
 						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
 							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
 					}
@@ -1662,7 +1716,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					if downDuration > 0 {
 						downMsg = fmt.Sprintf("\nDowntime: %v", downDuration.Round(time.Second))
 					}
-					if shouldAlert || acknowledged {
+					if sendLocalAlerts && (shouldAlert || acknowledged) {
 						m.SendAlert(fmt.Sprintf("✅ <b>%s</b> is UP\n\nEndpoint: <code>%s</code>\nResponse: %v%s",
 							ep.Name, displayURL, responseTime.Round(time.Millisecond), downMsg))
 						if sslWarnMsg != "" {
@@ -1673,7 +1727,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 				} else {
 					status.Consecutive++
 					m.mu.Unlock()
-					if shouldAlert && sendSlowAlert {
+					if sendLocalAlerts && shouldAlert && sendSlowAlert {
 						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
 							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
 					}
@@ -1693,7 +1747,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					m.recordIncidentStart(weeklyMetrics, now)
 					m.startIncident(ep, now, errMsg)
 					m.mu.Unlock()
-					if shouldAlert && !acknowledged {
+					if sendLocalAlerts && shouldAlert && !acknowledged {
 						m.SendAlert(fmt.Sprintf("🔴 <b>%s</b> is DOWN\n\nEndpoint: <code>%s</code>\nError: %s",
 							ep.Name, displayURL, errMsg))
 					}
@@ -1709,6 +1763,9 @@ func (m *Monitor) checkAll(ctx context.Context) {
 		}(ep)
 	}
 	wg.Wait()
+	if m.coordinatorURL != "" {
+		go m.SendRegionReport(ctx)
+	}
 }
 
 var prometheusLabelReplacer = strings.NewReplacer(
@@ -1754,6 +1811,130 @@ func (m *Monitor) MetricsHandler() http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		w.Write([]byte(builder.String()))
+	}
+}
+
+func (m *Monitor) BuildRegionReport() RegionReport {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	statuses := make(map[string]RegionStatus, len(m.statuses))
+	for _, ep := range m.config.Endpoints {
+		status := m.statuses[ep.Name]
+		if status == nil {
+			statuses[ep.Name] = RegionStatus{Up: false}
+			continue
+		}
+		statuses[ep.Name] = RegionStatus{
+			Up:             status.IsUp,
+			LastCheck:      status.LastCheck,
+			LastError:      status.LastError,
+			ResponseTimeMs: status.ResponseTime.Milliseconds(),
+		}
+	}
+
+	return RegionReport{Region: m.region, Statuses: statuses}
+}
+
+func (m *Monitor) SendRegionReport(ctx context.Context) {
+	if m.coordinatorURL == "" {
+		return
+	}
+	report := m.BuildRegionReport()
+	body, err := json.Marshal(report)
+	if err != nil {
+		log.Printf("Failed to encode region report: %v", err)
+		return
+	}
+
+	endpoint := strings.TrimRight(m.coordinatorURL, "/") + "/report"
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("Failed to create region report request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := m.alertClient.Do(req)
+	if err != nil {
+		log.Printf("Failed to send region report: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+func (m *Monitor) RegionReportHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var report RegionReport
+		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if report.Region == "" {
+			report.Region = "unknown"
+		}
+
+		m.mu.Lock()
+		for endpoint, status := range report.Statuses {
+			regions := m.regionReports[endpoint]
+			if regions == nil {
+				regions = make(map[string]RegionStatus)
+				m.regionReports[endpoint] = regions
+			}
+			previous, hadPrevious := regions[report.Region]
+			regions[report.Region] = status
+			if m.regionAlerts && hadPrevious && previous.Up != status.Up {
+				state := "DOWN"
+				if status.Up {
+					state = "UP"
+				}
+				message := fmt.Sprintf("🌍 <b>%s</b> %s in %s\n\nEndpoint: <code>%s</code>",
+					endpoint, state, report.Region, endpoint)
+				m.mu.Unlock()
+				m.SendAlert(message)
+				m.mu.Lock()
+			}
+		}
+		m.evaluateAggregatesLocked()
+		m.mu.Unlock()
+
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (m *Monitor) evaluateAggregatesLocked() {
+	if m.regionsRequired <= 1 {
+		return
+	}
+	for endpoint, regions := range m.regionReports {
+		downRegions := []string{}
+		for regionName, status := range regions {
+			if !status.Up {
+				downRegions = append(downRegions, regionName)
+			}
+		}
+		aggregatedDown := len(downRegions) >= m.regionsRequired
+		previous, hadPrevious := m.aggregateStatus[endpoint]
+		if hadPrevious && previous == aggregatedDown {
+			continue
+		}
+		m.aggregateStatus[endpoint] = aggregatedDown
+		state := "UP"
+		icon := "✅"
+		if aggregatedDown {
+			state = "DOWN"
+			icon = "🔴"
+		}
+		message := fmt.Sprintf("%s <b>%s</b> is %s in %d/%d regions\n\nEndpoint: <code>%s</code>\nRegions: %s",
+			icon, endpoint, state, len(downRegions), len(regions), endpoint, strings.Join(downRegions, ", "))
+		m.mu.Unlock()
+		m.SendAlert(message)
+		m.mu.Lock()
 	}
 }
 
@@ -1803,6 +1984,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", monitor.HealthHandler())
 	mux.HandleFunc("/status", monitor.HealthHandler())
+	mux.HandleFunc("/report", monitor.RegionReportHandler())
 	if metricsPort == "" || metricsPort == port {
 		mux.HandleFunc("/metrics", monitor.MetricsHandler())
 	}

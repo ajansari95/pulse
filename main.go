@@ -11,12 +11,14 @@ import (
 	"html/template"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,6 +87,8 @@ type Endpoint struct {
 	CriticalDays int    `yaml:"critical_days,omitempty" json:"critical_days,omitempty"`
 	CACertFile   string `yaml:"ca_cert_file,omitempty" json:"ca_cert_file,omitempty"`
 
+	Latency *LatencyConfig `yaml:"latency,omitempty" json:"latency,omitempty"`
+
 	// HTTP options
 	Method      string            `yaml:"method,omitempty" json:"method,omitempty"`             // GET, POST, PUT, DELETE, HEAD, OPTIONS
 	Headers     map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`           // Custom headers
@@ -115,6 +119,13 @@ type Endpoint struct {
 	RPCMethod string `yaml:"rpc_method,omitempty" json:"rpc_method,omitempty"`
 }
 
+type LatencyConfig struct {
+	P50Threshold string `yaml:"p50_threshold,omitempty" json:"p50_threshold,omitempty"`
+	P95Threshold string `yaml:"p95_threshold,omitempty" json:"p95_threshold,omitempty"`
+	P99Threshold string `yaml:"p99_threshold,omitempty" json:"p99_threshold,omitempty"`
+	Window       string `yaml:"window,omitempty" json:"window,omitempty"`
+}
+
 type BasicAuth struct {
 	Username string `yaml:"username" json:"username"`
 	Password string `yaml:"password" json:"password"`
@@ -126,6 +137,9 @@ type EndpointStatus struct {
 	LastCheck      time.Time
 	LastError      string
 	ResponseTime   time.Duration
+	LatencyP50     time.Duration
+	LatencyP95     time.Duration
+	LatencyP99     time.Duration
 	Consecutive    int
 	DownSince      time.Time
 	ConsecFailures int
@@ -145,6 +159,17 @@ type HistoryPoint struct {
 	Timestamp      time.Time `json:"timestamp"`
 	ResponseTimeMs int64     `json:"response_time_ms"`
 	Up             bool      `json:"up"`
+}
+
+type LatencySample struct {
+	Timestamp time.Time
+	Duration  time.Duration
+}
+
+type LatencyStats struct {
+	P50 time.Duration
+	P95 time.Duration
+	P99 time.Duration
 }
 
 type IncidentEvent struct {
@@ -184,6 +209,7 @@ type Monitor struct {
 	totalFailures    map[string]int
 	sslExpiry        map[string]time.Time
 	sslLastWarn      map[string]time.Time
+	latencySamples   map[string][]LatencySample
 	mutes            map[string]time.Time
 	acknowledged     map[string]time.Time
 	maintenanceUntil map[string]time.Time
@@ -338,6 +364,7 @@ func NewMonitor(config Config, configPath string, configHash uint64) *Monitor {
 		totalFailures:    make(map[string]int),
 		sslExpiry:        make(map[string]time.Time),
 		sslLastWarn:      make(map[string]time.Time),
+		latencySamples:   make(map[string][]LatencySample),
 		mutes:            make(map[string]time.Time),
 		acknowledged:     make(map[string]time.Time),
 		maintenanceUntil: make(map[string]time.Time),
@@ -1220,6 +1247,112 @@ func responseTimeMs(status *EndpointStatus) int64 {
 	return status.ResponseTime.Milliseconds()
 }
 
+type parsedLatencyConfig struct {
+	p50    time.Duration
+	p95    time.Duration
+	p99    time.Duration
+	window time.Duration
+}
+
+func parseLatencyDuration(value string) time.Duration {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0
+	}
+	parsed, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return 0
+	}
+	return parsed
+}
+
+func parseLatencyConfig(cfg *LatencyConfig) parsedLatencyConfig {
+	if cfg == nil {
+		return parsedLatencyConfig{}
+	}
+	window := parseLatencyDuration(cfg.Window)
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	return parsedLatencyConfig{
+		p50:    parseLatencyDuration(cfg.P50Threshold),
+		p95:    parseLatencyDuration(cfg.P95Threshold),
+		p99:    parseLatencyDuration(cfg.P99Threshold),
+		window: window,
+	}
+}
+
+func percentileDuration(sorted []time.Duration, percentile float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if percentile <= 0 {
+		return sorted[0]
+	}
+	if percentile >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	rank := int(math.Ceil(percentile*float64(len(sorted)))) - 1
+	if rank < 0 {
+		rank = 0
+	}
+	if rank >= len(sorted) {
+		rank = len(sorted) - 1
+	}
+	return sorted[rank]
+}
+
+func (m *Monitor) updateLatencyWindowLocked(name string, now time.Time, responseTime time.Duration, window time.Duration) (LatencyStats, bool) {
+	if window <= 0 {
+		return LatencyStats{}, false
+	}
+	samples := m.latencySamples[name]
+	samples = append(samples, LatencySample{Timestamp: now, Duration: responseTime})
+	cutoff := now.Add(-window)
+	index := 0
+	for index < len(samples) && samples[index].Timestamp.Before(cutoff) {
+		index++
+	}
+	if index > 0 {
+		samples = samples[index:]
+	}
+	m.latencySamples[name] = samples
+	if len(samples) == 0 {
+		return LatencyStats{}, false
+	}
+	durations := make([]time.Duration, len(samples))
+	for i, sample := range samples {
+		durations[i] = sample.Duration
+	}
+	sort.Slice(durations, func(i, j int) bool {
+		return durations[i] < durations[j]
+	})
+	stats := LatencyStats{
+		P50: percentileDuration(durations, 0.50),
+		P95: percentileDuration(durations, 0.95),
+		P99: percentileDuration(durations, 0.99),
+	}
+	return stats, true
+}
+
+func buildLatencyAlertMessage(name, displayURL string, stats LatencyStats, cfg parsedLatencyConfig) string {
+	lines := []string{}
+	if cfg.p50 > 0 && stats.P50 > cfg.p50 {
+		lines = append(lines, fmt.Sprintf("p50 %v (threshold: %v)", stats.P50.Round(time.Millisecond), cfg.p50))
+	}
+	if cfg.p95 > 0 && stats.P95 > cfg.p95 {
+		lines = append(lines, fmt.Sprintf("p95 %v (threshold: %v)", stats.P95.Round(time.Millisecond), cfg.p95))
+	}
+	if cfg.p99 > 0 && stats.P99 > cfg.p99 {
+		lines = append(lines, fmt.Sprintf("p99 %v (threshold: %v)", stats.P99.Round(time.Millisecond), cfg.p99))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("⚠️ <b>%s</b> latency percentiles exceeded\n\nEndpoint: <code>%s</code>\n%s",
+		name, displayURL, strings.Join(lines, "\n"))
+}
+
 func (m *Monitor) DashboardSummaryHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m.mu.RLock()
@@ -1704,6 +1837,27 @@ func (m *Monitor) checkAll(ctx context.Context) {
 			wasUp := status.IsUp
 			status.LastCheck = now
 			status.ResponseTime = responseTime
+			latencyAlert := ""
+			if ep.Latency != nil {
+				latencyConfig := parseLatencyConfig(ep.Latency)
+				latencyStats, hasLatency := m.updateLatencyWindowLocked(ep.Name, now, responseTime, latencyConfig.window)
+				if hasLatency {
+					status.LatencyP50 = latencyStats.P50
+					status.LatencyP95 = latencyStats.P95
+					status.LatencyP99 = latencyStats.P99
+					if isUp {
+						latencyAlert = buildLatencyAlertMessage(ep.Name, displayURL, latencyStats, latencyConfig)
+					}
+				} else {
+					status.LatencyP50 = 0
+					status.LatencyP95 = 0
+					status.LatencyP99 = 0
+				}
+			} else {
+				status.LatencyP50 = 0
+				status.LatencyP95 = 0
+				status.LatencyP99 = 0
+			}
 
 			dailyMetrics := m.dailyMetrics[ep.Name]
 			weeklyMetrics := m.weeklyMetrics[ep.Name]
@@ -1766,6 +1920,9 @@ func (m *Monitor) checkAll(ctx context.Context) {
 						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
 							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
 					}
+					if sendLocalAlerts && shouldAlert && latencyAlert != "" {
+						m.SendAlert(latencyAlert)
+					}
 					downMsg := ""
 					if downDuration > 0 {
 						downMsg = fmt.Sprintf("\nDowntime: %v", downDuration.Round(time.Second))
@@ -1784,6 +1941,9 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					if sendLocalAlerts && shouldAlert && sendSlowAlert {
 						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
 							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
+					}
+					if sendLocalAlerts && shouldAlert && latencyAlert != "" {
+						m.SendAlert(latencyAlert)
 					}
 					if sslWarnMsg != "" {
 						m.SendAlert(sslWarnMsg)
@@ -1840,6 +2000,7 @@ func (m *Monitor) MetricsHandler() http.HandlerFunc {
 		var builder strings.Builder
 		builder.WriteString("# TYPE pulse_endpoint_up gauge\n")
 		builder.WriteString("# TYPE pulse_endpoint_response_time_seconds gauge\n")
+		builder.WriteString("# TYPE pulse_endpoint_latency_seconds gauge\n")
 		builder.WriteString("# TYPE pulse_endpoint_total_checks counter\n")
 		builder.WriteString("# TYPE pulse_endpoint_total_failures counter\n")
 
@@ -1859,6 +2020,11 @@ func (m *Monitor) MetricsHandler() http.HandlerFunc {
 
 			fmt.Fprintf(&builder, "pulse_endpoint_up{name=\"%s\"} %d\n", label, up)
 			fmt.Fprintf(&builder, "pulse_endpoint_response_time_seconds{name=\"%s\"} %.6f\n", label, responseSeconds)
+			if ep.Latency != nil && status != nil {
+				fmt.Fprintf(&builder, "pulse_endpoint_latency_seconds{name=\"%s\",percentile=\"p50\"} %.6f\n", label, status.LatencyP50.Seconds())
+				fmt.Fprintf(&builder, "pulse_endpoint_latency_seconds{name=\"%s\",percentile=\"p95\"} %.6f\n", label, status.LatencyP95.Seconds())
+				fmt.Fprintf(&builder, "pulse_endpoint_latency_seconds{name=\"%s\",percentile=\"p99\"} %.6f\n", label, status.LatencyP99.Seconds())
+			}
 			fmt.Fprintf(&builder, "pulse_endpoint_total_checks{name=\"%s\"} %d\n", label, checks)
 			fmt.Fprintf(&builder, "pulse_endpoint_total_failures{name=\"%s\"} %d\n", label, failures)
 		}
@@ -1936,12 +2102,16 @@ func (m *Monitor) ReloadConfig(trigger string) error {
 
 	newStatuses := make(map[string]*EndpointStatus)
 	for _, ep := range config.Endpoints {
+		if existing, ok := m.statuses[ep.Name]; ok {
 			newStatus := &EndpointStatus{
 				Endpoint:       ep,
 				IsUp:           existing.IsUp,
 				LastCheck:      existing.LastCheck,
 				LastError:      existing.LastError,
 				ResponseTime:   existing.ResponseTime,
+				LatencyP50:     existing.LatencyP50,
+				LatencyP95:     existing.LatencyP95,
+				LatencyP99:     existing.LatencyP99,
 				Consecutive:    existing.Consecutive,
 				DownSince:      existing.DownSince,
 				ConsecFailures: existing.ConsecFailures,
@@ -1959,6 +2129,7 @@ func (m *Monitor) ReloadConfig(trigger string) error {
 	newFailures := make(map[string]int)
 	newExpiry := make(map[string]time.Time)
 	newWarn := make(map[string]time.Time)
+	newLatency := make(map[string][]LatencySample)
 	newRegions := make(map[string]map[string]RegionStatus)
 	newAggregate := make(map[string]bool)
 	newLastReport := make(map[string]time.Time)
@@ -1983,6 +2154,11 @@ func (m *Monitor) ReloadConfig(trigger string) error {
 		newFailures[ep.Name] = m.totalFailures[ep.Name]
 		newExpiry[ep.Name] = m.sslExpiry[ep.Name]
 		newWarn[ep.Name] = m.sslLastWarn[ep.Name]
+		if samples, ok := m.latencySamples[ep.Name]; ok {
+			newLatency[ep.Name] = samples
+		} else {
+			newLatency[ep.Name] = []LatencySample{}
+		}
 		if regionStatus, ok := m.regionReports[ep.Name]; ok {
 			newRegions[ep.Name] = regionStatus
 		}
@@ -2024,6 +2200,7 @@ func (m *Monitor) ReloadConfig(trigger string) error {
 	m.totalFailures = newFailures
 	m.sslExpiry = newExpiry
 	m.sslLastWarn = newWarn
+	m.latencySamples = newLatency
 	m.regionReports = newRegions
 	m.aggregateStatus = newAggregate
 	m.regionLastReport = newLastReport

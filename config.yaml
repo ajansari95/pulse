@@ -31,6 +31,10 @@ endpoints:
   - name: "API Health"
     url: "https://api.example.com/health"
     type: "http"
+    latency:
+      p95_threshold: "500ms"
+      p99_threshold: "1s"
+      window: "5m"
 
   # HTTP with custom method and headers
   - name: "API with Auth"

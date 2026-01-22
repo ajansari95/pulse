@@ -1934,22 +1934,25 @@ func (m *Monitor) ReloadConfig(trigger string) error {
 		reportStaleAfter = 2 * checkInterval
 	}
 
+	added := []string{}
+	removed := []string{}
+
+	m.mu.Lock()
 	newStatuses := make(map[string]*EndpointStatus)
 	for _, ep := range config.Endpoints {
-			newStatus := &EndpointStatus{
-				Endpoint:       ep,
-				IsUp:           existing.IsUp,
-				LastCheck:      existing.LastCheck,
-				LastError:      existing.LastError,
-				ResponseTime:   existing.ResponseTime,
-				Consecutive:    existing.Consecutive,
-				DownSince:      existing.DownSince,
-				ConsecFailures: existing.ConsecFailures,
-			}
-			newStatuses[ep.Name] = newStatus
-			continue
+		if existing, ok := m.statuses[ep.Name]; ok {
+			copyStatus := *existing
+			copyStatus.Endpoint = ep
+			newStatuses[ep.Name] = &copyStatus
+		} else {
+			newStatuses[ep.Name] = &EndpointStatus{Endpoint: ep, IsUp: true}
+			added = append(added, ep.Name)
 		}
-		newStatuses[ep.Name] = &EndpointStatus{Endpoint: ep, IsUp: true}
+	}
+	for name := range m.statuses {
+		if _, ok := newStatuses[name]; !ok {
+			removed = append(removed, name)
+		}
 	}
 
 	newDaily := make(map[string]*EndpointMetrics)
@@ -1992,20 +1995,6 @@ func (m *Monitor) ReloadConfig(trigger string) error {
 		newLastReport[regionName] = lastSeen
 	}
 
-	removed := []string{}
-	for name := range m.statuses {
-		if _, ok := newStatuses[name]; !ok {
-			removed = append(removed, name)
-		}
-	}
-	added := []string{}
-	for name := range newStatuses {
-		if _, ok := m.statuses[name]; !ok {
-			added = append(added, name)
-		}
-	}
-
-	m.mu.Lock()
 	m.config = *config
 	m.checkInterval = checkInterval
 	m.slowThreshold = slowThreshold

@@ -15,6 +15,7 @@ Lightweight endpoint monitoring with Telegram alerts. Single binary, zero depend
 - **Summary reports** - Daily/weekly uptime summaries
 - **Webhook notifications** - Slack, Discord, PagerDuty
 - **Web dashboard** - Status, charts, incident history
+- **Prometheus metrics** - `/metrics` endpoint for scraping
 - **Single binary** - No runtime dependencies
 
 ## Install
@@ -69,6 +70,7 @@ settings:
   slow_threshold: "5s"       # Alert if response exceeds this
   timeout: "10s"             # Default request timeout
   port: "8080"               # Health endpoint port
+  metrics_port: "9090"       # Metrics endpoint port (optional)
   daily_summary: "09:00"     # Daily summary time (local)
   weekly_summary: "monday 09:00" # Weekly summary schedule (local)
   public_dashboard: true      # Enable the web dashboard
@@ -198,7 +200,12 @@ Override settings via env:
 - `TELEGRAM_CHAT_ID`
 - `CHECK_INTERVAL`
 - `PORT`
+- `METRICS_PORT`
 - `PUBLIC_DASHBOARD`
+
+## Prometheus Metrics
+
+Expose metrics for scraping at `GET /metrics`. If `metrics_port` is set, metrics are served on that port; otherwise, they are served on the main HTTP port.
 
 ## Web Dashboard
 

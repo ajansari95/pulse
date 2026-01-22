@@ -16,6 +16,7 @@ settings:
   slow_threshold: "5s"
   timeout: "10s"
   port: "8080"
+  metrics_port: "9090"
   daily_summary: "09:00"
   weekly_summary: "monday 09:00"
   public_dashboard: true

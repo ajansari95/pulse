@@ -51,6 +51,7 @@ type Config struct {
 		FailureThreshold int    `yaml:"failure_threshold" json:"failure_threshold"`
 		SlowThreshold    string `yaml:"slow_threshold" json:"slow_threshold"`
 		Port             string `yaml:"port" json:"port"`
+		MetricsPort      string `yaml:"metrics_port" json:"metrics_port"`
 		Timeout          string `yaml:"timeout" json:"timeout"`
 		DailySummary     string `yaml:"daily_summary" json:"daily_summary"`
 		WeeklySummary    string `yaml:"weekly_summary" json:"weekly_summary"`
@@ -147,6 +148,8 @@ type Monitor struct {
 	incidents        []IncidentEvent
 	activeIncidents  map[string]int
 	historyLimit     int
+	totalChecks      map[string]int
+	totalFailures    map[string]int
 	alertClient      *http.Client
 	mu               sync.RWMutex
 }
@@ -178,6 +181,9 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("PORT"); v != "" {
 		c.Settings.Port = v
+	}
+	if v := os.Getenv("METRICS_PORT"); v != "" {
+		c.Settings.MetricsPort = v
 	}
 	if v := os.Getenv("PUBLIC_DASHBOARD"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
@@ -217,6 +223,8 @@ func NewMonitor(config Config) *Monitor {
 		incidents:        []IncidentEvent{},
 		activeIncidents:  make(map[string]int),
 		historyLimit:     500,
+		totalChecks:      make(map[string]int),
+		totalFailures:    make(map[string]int),
 		alertClient:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -757,6 +765,12 @@ func (m *Monitor) ensureMetrics(ep Endpoint) {
 	if _, ok := m.history[ep.Name]; !ok {
 		m.history[ep.Name] = []HistoryPoint{}
 	}
+	if _, ok := m.totalChecks[ep.Name]; !ok {
+		m.totalChecks[ep.Name] = 0
+	}
+	if _, ok := m.totalFailures[ep.Name]; !ok {
+		m.totalFailures[ep.Name] = 0
+	}
 }
 
 func (m *Monitor) recordCheckMetrics(metrics *EndpointMetrics, isUp bool, responseTime time.Duration) {
@@ -1288,6 +1302,10 @@ func (m *Monitor) checkAll(ctx context.Context) {
 			m.recordCheckMetrics(dailyMetrics, isUp, responseTime)
 			m.recordCheckMetrics(weeklyMetrics, isUp, responseTime)
 			m.recordHistory(ep, now, responseTime, isUp)
+			m.totalChecks[ep.Name]++
+			if !isUp {
+				m.totalFailures[ep.Name]++
+			}
 
 			if isUp {
 				status.LastError = ""
@@ -1352,6 +1370,52 @@ func (m *Monitor) checkAll(ctx context.Context) {
 	wg.Wait()
 }
 
+var prometheusLabelReplacer = strings.NewReplacer(
+	"\\", "\\\\",
+	"\n", "\\n",
+	"\"", "\\\"",
+)
+
+func prometheusLabelValue(value string) string {
+	return prometheusLabelReplacer.Replace(value)
+}
+
+func (m *Monitor) MetricsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+
+		var builder strings.Builder
+		builder.WriteString("# TYPE pulse_endpoint_up gauge\n")
+		builder.WriteString("# TYPE pulse_endpoint_response_time_seconds gauge\n")
+		builder.WriteString("# TYPE pulse_endpoint_total_checks counter\n")
+		builder.WriteString("# TYPE pulse_endpoint_total_failures counter\n")
+
+		for _, ep := range m.config.Endpoints {
+			label := prometheusLabelValue(ep.Name)
+			status := m.statuses[ep.Name]
+			up := 0
+			responseSeconds := 0.0
+			if status != nil {
+				if status.IsUp {
+					up = 1
+				}
+				responseSeconds = status.ResponseTime.Seconds()
+			}
+			checks := m.totalChecks[ep.Name]
+			failures := m.totalFailures[ep.Name]
+
+			fmt.Fprintf(&builder, "pulse_endpoint_up{name=\"%s\"} %d\n", label, up)
+			fmt.Fprintf(&builder, "pulse_endpoint_response_time_seconds{name=\"%s\"} %.6f\n", label, responseSeconds)
+			fmt.Fprintf(&builder, "pulse_endpoint_total_checks{name=\"%s\"} %d\n", label, checks)
+			fmt.Fprintf(&builder, "pulse_endpoint_total_failures{name=\"%s\"} %d\n", label, failures)
+		}
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.Write([]byte(builder.String()))
+	}
+}
+
 func (m *Monitor) HealthHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m.mu.RLock()
@@ -1393,10 +1457,14 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+	metricsPort := strings.TrimSpace(config.Settings.MetricsPort)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", monitor.HealthHandler())
 	mux.HandleFunc("/status", monitor.HealthHandler())
+	if metricsPort == "" || metricsPort == port {
+		mux.HandleFunc("/metrics", monitor.MetricsHandler())
+	}
 
 	publicDashboard := true
 	if config.Settings.PublicDashboard != nil {
@@ -1423,6 +1491,13 @@ func main() {
 	}
 	server := &http.Server{Addr: ":" + port, Handler: mux}
 
+	var metricsServer *http.Server
+	if metricsPort != "" && metricsPort != port {
+		metricsMux := http.NewServeMux()
+		metricsMux.HandleFunc("/metrics", monitor.MetricsHandler())
+		metricsServer = &http.Server{Addr: ":" + metricsPort, Handler: metricsMux}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1433,6 +1508,9 @@ func main() {
 		log.Println("Shutting down...")
 		cancel()
 		server.Shutdown(context.Background())
+		if metricsServer != nil {
+			metricsServer.Shutdown(context.Background())
+		}
 	}()
 
 	go monitor.Run(ctx)
@@ -1446,6 +1524,14 @@ func main() {
 	monitor.SendAlert(startupMsg)
 
 	log.Printf("Server starting on :%s", port)
+	if metricsServer != nil {
+		go func() {
+			log.Printf("Metrics server starting on :%s", metricsPort)
+			if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("Metrics server error: %v", err)
+			}
+		}()
+	}
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}

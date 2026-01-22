@@ -156,3 +156,53 @@ func TestIsWithinWeeklyWindow(t *testing.T) {
 		t.Fatalf("expected outside maintenance window")
 	}
 }
+
+func TestBuildRegionReport(t *testing.T) {
+	config := Config{}
+	config.Settings.Region = "us-east-1"
+	config.Endpoints = []Endpoint{{Name: "api"}}
+
+	monitor := NewMonitor(config)
+	monitor.statuses["api"] = &EndpointStatus{IsUp: true, ResponseTime: 50 * time.Millisecond}
+
+	report := monitor.BuildRegionReport()
+	if report.Region != "us-east-1" {
+		t.Fatalf("expected region us-east-1, got %s", report.Region)
+	}
+	status, ok := report.Statuses["api"]
+	if !ok || !status.Up {
+		t.Fatalf("expected api status to be up")
+	}
+}
+
+func TestEvaluateAggregatesStaleReports(t *testing.T) {
+	config := Config{}
+	config.Settings.RegionsRequired = 2
+	config.Settings.ReportStaleAfter = "1m"
+	config.Endpoints = []Endpoint{{Name: "API"}}
+
+	monitor := NewMonitor(config)
+	monitor.regionReports["API"] = map[string]RegionStatus{
+		"us": {Up: false},
+		"eu": {Up: false},
+	}
+	now := time.Now()
+	monitor.regionLastReport["us"] = now.Add(-2 * time.Minute)
+	monitor.regionLastReport["eu"] = now
+
+	monitor.mu.Lock()
+	alerts := monitor.evaluateAggregatesLocked(now)
+	monitor.mu.Unlock()
+	if len(alerts) != 0 {
+		t.Fatalf("expected no alerts for stale reports")
+	}
+
+	monitor.regionLastReport["us"] = now
+	monitor.regionReports["API"]["us"] = RegionStatus{Up: false}
+	monitor.mu.Lock()
+	alerts = monitor.evaluateAggregatesLocked(now)
+	monitor.mu.Unlock()
+	if len(alerts) == 0 {
+		t.Fatalf("expected aggregate alert when both regions report down")
+	}
+}

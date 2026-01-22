@@ -20,6 +20,11 @@ settings:
   daily_summary: "09:00"
   weekly_summary: "monday 09:00"
   public_dashboard: true
+  region: "us-east-1"
+  coordinator_url: ""
+  regions_required: 2
+  region_alerts: false
+  report_stale_after: "5m"
 
 endpoints:
   # Simple HTTP health check

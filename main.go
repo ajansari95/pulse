@@ -1363,6 +1363,15 @@ func (m *Monitor) setMaintenance(endpoint string, until time.Time) {
 	m.mu.Unlock()
 }
 
+func (m *Monitor) endpointExists(name string) bool {
+	for _, ep := range m.config.Endpoints {
+		if ep.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Monitor) runDailySummary(ctx context.Context, hour, minute int) {
 	for {
 		nextRun := nextDailyRun(time.Now(), hour, minute)
@@ -1492,6 +1501,10 @@ func (m *Monitor) PollTelegramCommands(ctx context.Context) {
 						m.sendTelegram(chatID, "Usage: /mute <endpoint> <duration>")
 						continue
 					}
+					if !m.endpointExists(parts[1]) {
+						m.sendTelegram(chatID, fmt.Sprintf("Unknown endpoint: %s", parts[1]))
+						continue
+					}
 					duration, err := time.ParseDuration(parts[2])
 					if err != nil {
 						m.sendTelegram(chatID, "Invalid duration. Example: /mute API 30m")
@@ -1506,12 +1519,20 @@ func (m *Monitor) PollTelegramCommands(ctx context.Context) {
 						m.sendTelegram(chatID, "Usage: /ack <endpoint>")
 						continue
 					}
+					if !m.endpointExists(parts[1]) {
+						m.sendTelegram(chatID, fmt.Sprintf("Unknown endpoint: %s", parts[1]))
+						continue
+					}
 					m.setAcknowledged(parts[1], time.Now())
 					m.sendTelegram(chatID, fmt.Sprintf("Acknowledged %s", parts[1]))
 				case strings.HasPrefix(text, "/maintenance start "):
 					parts := strings.Fields(text)
 					if len(parts) < 4 {
 						m.sendTelegram(chatID, "Usage: /maintenance start <endpoint> <duration>")
+						continue
+					}
+					if !m.endpointExists(parts[2]) {
+						m.sendTelegram(chatID, fmt.Sprintf("Unknown endpoint: %s", parts[2]))
 						continue
 					}
 					duration, err := time.ParseDuration(parts[3])
@@ -1667,6 +1688,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 				if status.ConsecFailures == m.failureThreshold && status.IsUp {
 					status.IsUp = false
 					status.DownSince = now
+					delete(m.acknowledged, ep.Name)
 					m.recordIncidentStart(dailyMetrics, now)
 					m.recordIncidentStart(weeklyMetrics, now)
 					m.startIncident(ep, now, errMsg)

@@ -1936,9 +1936,17 @@ func (m *Monitor) ReloadConfig(trigger string) error {
 
 	newStatuses := make(map[string]*EndpointStatus)
 	for _, ep := range config.Endpoints {
-		if existing, ok := m.statuses[ep.Name]; ok {
-			existing.Endpoint = ep
-			newStatuses[ep.Name] = existing
+			newStatus := &EndpointStatus{
+				Endpoint:       ep,
+				IsUp:           existing.IsUp,
+				LastCheck:      existing.LastCheck,
+				LastError:      existing.LastError,
+				ResponseTime:   existing.ResponseTime,
+				Consecutive:    existing.Consecutive,
+				DownSince:      existing.DownSince,
+				ConsecFailures: existing.ConsecFailures,
+			}
+			newStatuses[ep.Name] = newStatus
 			continue
 		}
 		newStatuses[ep.Name] = &EndpointStatus{Endpoint: ep, IsUp: true}

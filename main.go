@@ -642,11 +642,7 @@ func formatDuration(duration time.Duration) string {
 	return duration.Round(time.Second).String()
 }
 
-func (m *Monitor) buildSummaryMessage(label string, metrics map[string]*EndpointMetrics) string {
-	if len(m.statuses) == 0 {
-		return ""
-	}
-
+func (m *Monitor) buildSummaryMessage(label string, metrics map[string]*EndpointMetrics, now time.Time) string {
 	if len(m.statuses) == 0 {
 		return ""
 	}
@@ -673,13 +669,13 @@ func (m *Monitor) buildSummaryMessage(label string, metrics map[string]*Endpoint
 
 		longestDowntime := metric.LongestDowntime
 		if !metric.ActiveDowntimeFrom.IsZero() {
-			current := time.Since(metric.ActiveDowntimeFrom)
+			current := now.Sub(metric.ActiveDowntimeFrom)
 			if current > longestDowntime {
 				longestDowntime = current
 			}
 		}
 		if status != nil && !status.DownSince.IsZero() && metric.ActiveDowntimeFrom.IsZero() {
-			current := time.Since(status.DownSince)
+			current := now.Sub(status.DownSince)
 			if current > longestDowntime {
 				longestDowntime = current
 			}
@@ -697,20 +693,17 @@ func (m *Monitor) buildSummaryMessage(label string, metrics map[string]*Endpoint
 		fmt.Fprintf(&builder, "Longest downtime: <code>%s</code>\n\n", formatDuration(longestDowntime))
 	}
 
-	fmt.Fprintf(&builder, "Report generated: %s", time.Now().Format("2006-01-02 15:04 MST"))
+	fmt.Fprintf(&builder, "Report generated: %s", now.Format("2006-01-02 15:04 MST"))
 	return builder.String()
 }
 
 func (m *Monitor) resetMetrics(metrics map[string]*EndpointMetrics) {
 	for name, metric := range metrics {
-		activeDowntime := metric.ActiveDowntimeFrom
 		*metric = EndpointMetrics{}
 		status := m.statuses[name]
 		if status != nil && !status.IsUp {
-			metric.ActiveDowntimeFrom = activeDowntime
-			if !activeDowntime.IsZero() {
-				metric.Incidents = 1
-			}
+			metric.ActiveDowntimeFrom = status.DownSince
+			metric.Incidents = 1
 		}
 	}
 }
@@ -820,28 +813,29 @@ func (m *Monitor) ScheduleSummaryReports(ctx context.Context) {
 }
 
 func (m *Monitor) SendDailySummary() {
+	now := time.Now()
 	m.mu.Lock()
-	message := m.buildSummaryMessage("Daily", m.dailyMetrics)
-	if message != "" {
-		m.resetMetrics(m.dailyMetrics)
+	message := m.buildSummaryMessage("Daily", m.dailyMetrics, now)
+	if message == "" {
+		m.mu.Unlock()
+		return
 	}
+	m.resetMetrics(m.dailyMetrics)
 	m.mu.Unlock()
-	if message != "" {
-		m.SendAlert(message)
-	}
+	m.SendAlert(message)
 }
 
 func (m *Monitor) SendWeeklySummary() {
+	now := time.Now()
 	m.mu.Lock()
-	message := m.buildSummaryMessage("Weekly", m.weeklyMetrics)
-	if message != "" {
-		m.resetMetrics(m.weeklyMetrics)
+	message := m.buildSummaryMessage("Weekly", m.weeklyMetrics, now)
+	if message == "" {
+		m.mu.Unlock()
+		return
 	}
+	m.resetMetrics(m.weeklyMetrics)
 	m.mu.Unlock()
-	if message != "" {
-		m.SendAlert(message)
-	}
-}
+	m.SendAlert(message)
 }
 
 func (m *Monitor) PollTelegramCommands(ctx context.Context) {

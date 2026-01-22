@@ -1,0 +1,8 @@
+.git
+.github
+.vscode
+.DS_Store
+*.md
+dist
+tmp
+bin

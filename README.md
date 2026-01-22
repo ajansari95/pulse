@@ -25,6 +25,13 @@ Lightweight endpoint monitoring with Telegram alerts. Single binary, zero depend
 go install github.com/ajansari95/pulse@latest
 ```
 
+## Docker
+
+```bash
+docker pull ghcr.io/ajansari95/pulse:latest
+docker run --rm -p 8080:8080 -v "$PWD/config.yaml:/config.yaml" ghcr.io/ajansari95/pulse:latest /pulse /config.yaml
+```
+
 ## Quick Start
 
 ```bash

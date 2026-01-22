@@ -2,6 +2,14 @@ telegram:
   bot_token: ""  # or use TELEGRAM_BOT_TOKEN env var
   chat_id: ""    # or use TELEGRAM_CHAT_ID env var
 
+notifications:
+  slack:
+    webhook_url: ""
+  discord:
+    webhook_url: ""
+  pagerduty:
+    routing_key: ""
+
 settings:
   check_interval: "60s"
   failure_threshold: 2

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -76,6 +77,33 @@ func TestWebhookSendersSkipWhenUnset(t *testing.T) {
 	}
 	if err := monitor.sendPagerDutyAlert(AlertDetails{Kind: "down", PlainMessage: "test"}); err != nil {
 		t.Fatalf("expected pagerduty sender to skip, got %v", err)
+	}
+}
+
+func TestPrometheusLabelValue(t *testing.T) {
+	value := "api\"prod\\test\n"
+	if got := prometheusLabelValue(value); got != "api\\\"prod\\\\test\\n" {
+		t.Fatalf("unexpected label escape: %s", got)
+	}
+}
+
+func TestMetricsHandler(t *testing.T) {
+	config := Config{Endpoints: []Endpoint{{Name: "api\"prod"}}}
+	monitor := NewMonitor(config)
+	monitor.statuses["api\"prod"] = &EndpointStatus{IsUp: true, ResponseTime: 150 * time.Millisecond}
+	monitor.totalChecks["api\"prod"] = 3
+	monitor.totalFailures["api\"prod"] = 1
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	recorder := httptest.NewRecorder()
+	monitor.MetricsHandler().ServeHTTP(recorder, req)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "pulse_endpoint_up{name=\"api\\\"prod\"} 1") {
+		t.Fatalf("expected up metric, got %s", body)
+	}
+	if !strings.Contains(body, "pulse_endpoint_total_checks{name=\"api\\\"prod\"} 3") {
+		t.Fatalf("expected checks metric, got %s", body)
 	}
 }
 

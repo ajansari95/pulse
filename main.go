@@ -815,14 +815,15 @@ func (m *Monitor) ScheduleSummaryReports(ctx context.Context) {
 }
 
 func (m *Monitor) SendDailySummary() {
-	message := m.buildSummaryMessage("Daily", m.dailyMetrics)
-	if message == "" {
-		return
-	}
-	m.SendAlert(message)
 	m.mu.Lock()
-	m.resetMetrics(m.dailyMetrics)
+	message := m.buildSummaryMessage("Daily", m.dailyMetrics)
+	if message != "" {
+		m.resetMetrics(m.dailyMetrics)
+	}
 	m.mu.Unlock()
+	if message != "" {
+		m.SendAlert(message)
+	}
 }
 
 func (m *Monitor) SendWeeklySummary() {

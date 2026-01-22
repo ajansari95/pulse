@@ -59,7 +59,14 @@ type Config struct {
 		WeeklySummary    string `yaml:"weekly_summary" json:"weekly_summary"`
 		PublicDashboard  *bool  `yaml:"public_dashboard" json:"public_dashboard"`
 	} `yaml:"settings" json:"settings"`
-	Endpoints []Endpoint `yaml:"endpoints" json:"endpoints"`
+	Endpoints   []Endpoint          `yaml:"endpoints" json:"endpoints"`
+	Maintenance []MaintenanceWindow `yaml:"maintenance" json:"maintenance"`
+}
+
+type MaintenanceWindow struct {
+	Name      string   `yaml:"name" json:"name"`
+	Schedule  string   `yaml:"schedule" json:"schedule"`
+	Endpoints []string `yaml:"endpoints" json:"endpoints"`
 }
 
 type Endpoint struct {
@@ -159,6 +166,9 @@ type Monitor struct {
 	totalFailures    map[string]int
 	sslExpiry        map[string]time.Time
 	sslLastWarn      map[string]time.Time
+	mutes            map[string]time.Time
+	acknowledged     map[string]time.Time
+	maintenanceUntil map[string]time.Time
 	alertClient      *http.Client
 	mu               sync.RWMutex
 }
@@ -236,6 +246,9 @@ func NewMonitor(config Config) *Monitor {
 		totalFailures:    make(map[string]int),
 		sslExpiry:        make(map[string]time.Time),
 		sslLastWarn:      make(map[string]time.Time),
+		mutes:            make(map[string]time.Time),
+		acknowledged:     make(map[string]time.Time),
+		maintenanceUntil: make(map[string]time.Time),
 		alertClient:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -1216,6 +1229,47 @@ func parseWeeklySchedule(value string) (time.Weekday, int, int, bool) {
 	return weekday, hour, minute, true
 }
 
+func parseMaintenanceSchedule(value string) (time.Weekday, int, int, int, int, bool) {
+	parts := strings.Fields(strings.ToLower(strings.TrimSpace(value)))
+	if len(parts) != 2 {
+		return time.Sunday, 0, 0, 0, 0, false
+	}
+	weekday, ok := map[string]time.Weekday{
+		"sunday":    time.Sunday,
+		"monday":    time.Monday,
+		"tuesday":   time.Tuesday,
+		"wednesday": time.Wednesday,
+		"thursday":  time.Thursday,
+		"friday":    time.Friday,
+		"saturday":  time.Saturday,
+	}[parts[0]]
+	if !ok {
+		return time.Sunday, 0, 0, 0, 0, false
+	}
+	rangeParts := strings.Split(parts[1], "-")
+	if len(rangeParts) != 2 {
+		return time.Sunday, 0, 0, 0, 0, false
+	}
+	startHour, startMinute, ok := parseClock(rangeParts[0])
+	if !ok {
+		return time.Sunday, 0, 0, 0, 0, false
+	}
+	endHour, endMinute, ok := parseClock(rangeParts[1])
+	if !ok {
+		return time.Sunday, 0, 0, 0, 0, false
+	}
+	return weekday, startHour, startMinute, endHour, endMinute, true
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func nextDailyRun(now time.Time, hour, minute int) time.Time {
 	start := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
 	if !start.After(now) {
@@ -1234,6 +1288,79 @@ func nextWeeklyRun(now time.Time, weekday time.Weekday, hour, minute int) time.T
 		start = start.AddDate(0, 0, daysUntil)
 	}
 	return start
+}
+
+func isWithinWeeklyWindow(now time.Time, weekday time.Weekday, startHour, startMinute, endHour, endMinute int) bool {
+	start := time.Date(now.Year(), now.Month(), now.Day(), startHour, startMinute, 0, 0, now.Location())
+	delta := (int(weekday) - int(now.Weekday()) + 7) % 7
+	start = start.AddDate(0, 0, delta)
+	if start.After(now) {
+		start = start.AddDate(0, 0, -7)
+	}
+	end := time.Date(start.Year(), start.Month(), start.Day(), endHour, endMinute, 0, 0, start.Location())
+	if !end.After(start) {
+		end = end.Add(24 * time.Hour)
+	}
+	return (now.Equal(start) || now.After(start)) && now.Before(end)
+}
+
+func (m *Monitor) isMutedLocked(endpoint string, now time.Time) bool {
+	until, ok := m.mutes[endpoint]
+	if !ok {
+		return false
+	}
+	if now.After(until) {
+		delete(m.mutes, endpoint)
+		return false
+	}
+	return true
+}
+
+func (m *Monitor) isInMaintenanceLocked(endpoint string, now time.Time) bool {
+	until, ok := m.maintenanceUntil[endpoint]
+	if ok {
+		if now.After(until) {
+			delete(m.maintenanceUntil, endpoint)
+		} else {
+			return true
+		}
+	}
+	for _, window := range m.config.Maintenance {
+		if len(window.Endpoints) > 0 && !containsString(window.Endpoints, endpoint) {
+			continue
+		}
+		weekday, startHour, startMinute, endHour, endMinute, ok := parseMaintenanceSchedule(window.Schedule)
+		if !ok {
+			continue
+		}
+		if isWithinWeeklyWindow(now, weekday, startHour, startMinute, endHour, endMinute) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Monitor) isAcknowledgedLocked(endpoint string) bool {
+	_, ok := m.acknowledged[endpoint]
+	return ok
+}
+
+func (m *Monitor) setMute(endpoint string, until time.Time) {
+	m.mu.Lock()
+	m.mutes[endpoint] = until
+	m.mu.Unlock()
+}
+
+func (m *Monitor) setAcknowledged(endpoint string, at time.Time) {
+	m.mu.Lock()
+	m.acknowledged[endpoint] = at
+	m.mu.Unlock()
+}
+
+func (m *Monitor) setMaintenance(endpoint string, until time.Time) {
+	m.mu.Lock()
+	m.maintenanceUntil[endpoint] = until
+	m.mu.Unlock()
 }
 
 func (m *Monitor) runDailySummary(ctx context.Context, hour, minute int) {
@@ -1354,9 +1481,47 @@ func (m *Monitor) PollTelegramCommands(ctx context.Context) {
 				} else if u.ChannelPost != nil {
 					text, chatID = u.ChannelPost.Text, u.ChannelPost.Chat.ID
 				}
-				if text == "/status" {
+				text = strings.TrimSpace(text)
+				switch {
+				case text == "/status":
 					m.sendTelegram(chatID, m.GenerateStatusMessage())
 					log.Printf("Responded to /status from %d", chatID)
+				case strings.HasPrefix(text, "/mute "):
+					parts := strings.Fields(text)
+					if len(parts) < 3 {
+						m.sendTelegram(chatID, "Usage: /mute <endpoint> <duration>")
+						continue
+					}
+					duration, err := time.ParseDuration(parts[2])
+					if err != nil {
+						m.sendTelegram(chatID, "Invalid duration. Example: /mute API 30m")
+						continue
+					}
+					until := time.Now().Add(duration)
+					m.setMute(parts[1], until)
+					m.sendTelegram(chatID, fmt.Sprintf("Muted %s until %s", parts[1], until.Format("15:04 MST")))
+				case strings.HasPrefix(text, "/ack "):
+					parts := strings.Fields(text)
+					if len(parts) < 2 {
+						m.sendTelegram(chatID, "Usage: /ack <endpoint>")
+						continue
+					}
+					m.setAcknowledged(parts[1], time.Now())
+					m.sendTelegram(chatID, fmt.Sprintf("Acknowledged %s", parts[1]))
+				case strings.HasPrefix(text, "/maintenance start "):
+					parts := strings.Fields(text)
+					if len(parts) < 4 {
+						m.sendTelegram(chatID, "Usage: /maintenance start <endpoint> <duration>")
+						continue
+					}
+					duration, err := time.ParseDuration(parts[3])
+					if err != nil {
+						m.sendTelegram(chatID, "Invalid duration. Example: /maintenance start API 2h")
+						continue
+					}
+					until := time.Now().Add(duration)
+					m.setMaintenance(parts[2], until)
+					m.sendTelegram(chatID, fmt.Sprintf("Maintenance started for %s until %s", parts[2], until.Format("15:04 MST")))
 				}
 			}
 		}
@@ -1448,6 +1613,8 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					}
 				}
 			}
+			shouldAlert := !m.isMutedLocked(ep.Name, now) && !m.isInMaintenanceLocked(ep.Name, now)
+			acknowledged := m.isAcknowledgedLocked(ep.Name)
 			if isUp {
 				status.LastError = ""
 				status.ConsecFailures = 0
@@ -1466,7 +1633,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					status.DownSince = time.Time{}
 					status.Consecutive = 1
 					m.mu.Unlock()
-					if sendSlowAlert {
+					if shouldAlert && sendSlowAlert {
 						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
 							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
 					}
@@ -1474,15 +1641,18 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					if downDuration > 0 {
 						downMsg = fmt.Sprintf("\nDowntime: %v", downDuration.Round(time.Second))
 					}
-					m.SendAlert(fmt.Sprintf("✅ <b>%s</b> is UP\n\nEndpoint: <code>%s</code>\nResponse: %v%s",
-						ep.Name, displayURL, responseTime.Round(time.Millisecond), downMsg))
-					if sslWarnMsg != "" {
-						m.SendAlert(sslWarnMsg)
+					if shouldAlert || acknowledged {
+						m.SendAlert(fmt.Sprintf("✅ <b>%s</b> is UP\n\nEndpoint: <code>%s</code>\nResponse: %v%s",
+							ep.Name, displayURL, responseTime.Round(time.Millisecond), downMsg))
+						if sslWarnMsg != "" {
+							m.SendAlert(sslWarnMsg)
+						}
 					}
+					delete(m.acknowledged, ep.Name)
 				} else {
 					status.Consecutive++
 					m.mu.Unlock()
-					if sendSlowAlert {
+					if shouldAlert && sendSlowAlert {
 						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
 							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
 					}
@@ -1501,8 +1671,10 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					m.recordIncidentStart(weeklyMetrics, now)
 					m.startIncident(ep, now, errMsg)
 					m.mu.Unlock()
-					m.SendAlert(fmt.Sprintf("🔴 <b>%s</b> is DOWN\n\nEndpoint: <code>%s</code>\nError: %s",
-						ep.Name, displayURL, errMsg))
+					if shouldAlert && !acknowledged {
+						m.SendAlert(fmt.Sprintf("🔴 <b>%s</b> is DOWN\n\nEndpoint: <code>%s</code>\nError: %s",
+							ep.Name, displayURL, errMsg))
+					}
 				} else {
 					m.mu.Unlock()
 					if status.ConsecFailures < m.failureThreshold {

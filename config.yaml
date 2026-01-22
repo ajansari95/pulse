@@ -111,3 +111,8 @@ endpoints:
     url: "https://api.example.com/version"
     type: "http"
     match_regex: "v[0-9]+\\.[0-9]+\\.[0-9]+"
+
+maintenance:
+  - name: "Weekly deploy"
+    schedule: "sunday 02:00-04:00"
+    endpoints: ["API Health", "Database"]

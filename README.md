@@ -16,6 +16,7 @@ Lightweight endpoint monitoring with Telegram alerts. Single binary, zero depend
 - **Webhook notifications** - Slack, Discord, PagerDuty
 - **Web dashboard** - Status, charts, incident history
 - **Prometheus metrics** - `/metrics` endpoint for scraping
+- **Maintenance windows** - Scheduled/acknowledged incident suppression
 - **Single binary** - No runtime dependencies
 
 ## Install
@@ -74,6 +75,15 @@ settings:
   daily_summary: "09:00"     # Daily summary time (local)
   weekly_summary: "monday 09:00" # Weekly summary schedule (local)
   public_dashboard: true      # Enable the web dashboard
+```
+
+### Maintenance Windows
+
+```yaml
+maintenance:
+  - name: "Weekly deploy"
+    schedule: "sunday 02:00-04:00"
+    endpoints: ["API", "Database"]
 ```
 
 ### HTTP Endpoints
@@ -250,6 +260,13 @@ endpoints:
 2. Copy the token
 3. Add bot to your channel/group as admin
 4. Get chat ID: forward a message to [@userinfobot](https://t.me/userinfobot)
+
+## Telegram Commands
+
+- `/status` - Current status summary
+- `/mute <endpoint> <duration>` - Mute alerts (example: `/mute API 30m`)
+- `/ack <endpoint>` - Acknowledge an incident
+- `/maintenance start <endpoint> <duration>` - Start a maintenance window (example: `/maintenance start API 2h`)
 
 Send `/status` in chat to get current status.
 

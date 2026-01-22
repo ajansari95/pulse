@@ -703,10 +703,14 @@ func (m *Monitor) buildSummaryMessage(label string, metrics map[string]*Endpoint
 
 func (m *Monitor) resetMetrics(metrics map[string]*EndpointMetrics) {
 	for name, metric := range metrics {
+		activeDowntime := metric.ActiveDowntimeFrom
 		*metric = EndpointMetrics{}
 		status := m.statuses[name]
 		if status != nil && !status.IsUp {
-			metric.ActiveDowntimeFrom = time.Now()
+			metric.ActiveDowntimeFrom = activeDowntime
+			if !activeDowntime.IsZero() {
+				metric.Incidents = 1
+			}
 		}
 	}
 }

@@ -569,15 +569,48 @@ func (m *Monitor) SendAlert(message string) {
 		}
 	}
 
-	if err := m.sendSlackAlert(message); err != nil {
+	details := parseAlertDetails(message)
+
+	if err := m.sendSlackAlert(details.PlainMessage); err != nil {
 		log.Printf("Failed to send Slack alert: %v", err)
 	}
-	if err := m.sendDiscordAlert(message); err != nil {
+	if err := m.sendDiscordAlert(details.PlainMessage); err != nil {
 		log.Printf("Failed to send Discord alert: %v", err)
 	}
-	if err := m.sendPagerDutyAlert(message); err != nil {
+	if err := m.sendPagerDutyAlert(details); err != nil {
 		log.Printf("Failed to send PagerDuty alert: %v", err)
 	}
+}
+
+type AlertDetails struct {
+	Kind         string
+	EndpointName string
+	PlainMessage string
+}
+
+var htmlTagPattern = regexp.MustCompile("<[^>]+>")
+var boldTagPattern = regexp.MustCompile(`<b>([^<]+)</b>`)
+
+func parseAlertDetails(message string) AlertDetails {
+	plain := htmlTagPattern.ReplaceAllString(message, "")
+	kind := "info"
+
+	if strings.Contains(message, "Summary") {
+		kind = "summary"
+	} else if strings.Contains(message, "is DOWN") {
+		kind = "down"
+	} else if strings.Contains(message, "is UP") {
+		kind = "up"
+	} else if strings.Contains(message, "is SLOW") {
+		kind = "slow"
+	}
+
+	endpoint := ""
+	if matches := boldTagPattern.FindStringSubmatch(message); len(matches) > 1 {
+		endpoint = matches[1]
+	}
+
+	return AlertDetails{Kind: kind, EndpointName: endpoint, PlainMessage: plain}
 }
 
 func (m *Monitor) sendSlackAlert(message string) error {
@@ -620,19 +653,50 @@ func (m *Monitor) sendDiscordAlert(message string) error {
 	return nil
 }
 
-func (m *Monitor) sendPagerDutyAlert(message string) error {
+func (m *Monitor) sendPagerDutyAlert(details AlertDetails) error {
 	routingKey := strings.TrimSpace(m.config.Notifications.PagerDuty.RoutingKey)
 	if routingKey == "" {
 		return nil
 	}
+	if details.Kind == "summary" || details.Kind == "info" {
+		return nil
+	}
+
+	eventAction := "trigger"
+	severity := "error"
+	dedupKind := details.Kind
+	if details.Kind == "down" {
+		severity = "critical"
+	} else if details.Kind == "slow" {
+		severity = "warning"
+	} else if details.Kind == "up" {
+		eventAction = "resolve"
+		severity = "info"
+		dedupKind = "down"
+	}
+
+	endpointKey := strings.TrimSpace(details.EndpointName)
+	if endpointKey == "" {
+		endpointKey = "unknown"
+	}
+	endpointKey = strings.ReplaceAll(strings.ToLower(endpointKey), " ", "-")
+	dedupKey := fmt.Sprintf("pulse-%s-%s", endpointKey, dedupKind)
+
 	payload := map[string]interface{}{
 		"routing_key":  routingKey,
-		"event_action": "trigger",
-		"payload": map[string]interface{}{
-			"summary":  message,
+		"event_action": eventAction,
+		"dedup_key":    dedupKey,
+	}
+	if eventAction == "trigger" {
+		payload["payload"] = map[string]interface{}{
+			"summary":  details.PlainMessage,
 			"source":   "pulse",
-			"severity": "error",
-		},
+			"severity": severity,
+			"custom_details": map[string]interface{}{
+				"endpoint": details.EndpointName,
+				"kind":     details.Kind,
+			},
+		}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

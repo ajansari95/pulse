@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -73,7 +74,26 @@ func TestWebhookSendersSkipWhenUnset(t *testing.T) {
 	if err := monitor.sendDiscordAlert("test"); err != nil {
 		t.Fatalf("expected discord sender to skip, got %v", err)
 	}
-	if err := monitor.sendPagerDutyAlert("test"); err != nil {
+	if err := monitor.sendPagerDutyAlert(AlertDetails{Kind: "down", PlainMessage: "test"}); err != nil {
 		t.Fatalf("expected pagerduty sender to skip, got %v", err)
+	}
+}
+
+func TestParseAlertDetails(t *testing.T) {
+	message := "🔴 <b>API</b> is DOWN\n\nEndpoint: <code>https://example.com</code>\nError: timeout"
+	details := parseAlertDetails(message)
+	if details.Kind != "down" {
+		t.Fatalf("expected down kind, got %s", details.Kind)
+	}
+	if details.EndpointName != "API" {
+		t.Fatalf("expected endpoint API, got %s", details.EndpointName)
+	}
+	if strings.Contains(details.PlainMessage, "<b>") || strings.Contains(details.PlainMessage, "<code>") {
+		t.Fatalf("expected plain message to strip HTML tags")
+	}
+
+	summary := parseAlertDetails("📊 <b>Daily Summary</b>\n")
+	if summary.Kind != "summary" {
+		t.Fatalf("expected summary kind, got %s", summary.Kind)
 	}
 }

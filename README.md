@@ -13,6 +13,7 @@ Lightweight endpoint monitoring with Telegram alerts. Single binary, zero depend
 - **Environment variables** - Use `${VAR}` syntax in config
 - **Telegram alerts** - Instant down/up/slow notifications
 - **Summary reports** - Daily/weekly uptime summaries
+- **Webhook notifications** - Slack, Discord, PagerDuty
 - **Single binary** - No runtime dependencies
 
 ## Install
@@ -29,6 +30,14 @@ cat > config.yaml << 'EOF'
 telegram:
   bot_token: ""
   chat_id: ""
+
+notifications:
+  slack:
+    webhook_url: "https://hooks.slack.com/..."
+  discord:
+    webhook_url: "https://discord.com/api/webhooks/..."
+  pagerduty:
+    routing_key: "your-integration-key"
 
 settings:
   check_interval: "60s"
@@ -187,6 +196,10 @@ Override settings via env:
 - `TELEGRAM_CHAT_ID`
 - `CHECK_INTERVAL`
 - `PORT`
+
+## Webhook Notifications
+
+Pulse can also send alerts to Slack, Discord, and PagerDuty. Configure the webhook URLs or routing key under `notifications` in your config.
 
 ## Endpoint Types
 

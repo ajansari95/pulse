@@ -28,6 +28,17 @@ type Config struct {
 		BotToken string `yaml:"bot_token" json:"bot_token"`
 		ChatID   string `yaml:"chat_id" json:"chat_id"`
 	} `yaml:"telegram" json:"telegram"`
+	Notifications struct {
+		Slack struct {
+			WebhookURL string `yaml:"webhook_url" json:"webhook_url"`
+		} `yaml:"slack" json:"slack"`
+		Discord struct {
+			WebhookURL string `yaml:"webhook_url" json:"webhook_url"`
+		} `yaml:"discord" json:"discord"`
+		PagerDuty struct {
+			RoutingKey string `yaml:"routing_key" json:"routing_key"`
+		} `yaml:"pagerduty" json:"pagerduty"`
+	} `yaml:"notifications" json:"notifications"`
 	Settings struct {
 		CheckInterval    string `yaml:"check_interval" json:"check_interval"`
 		FailureThreshold int    `yaml:"failure_threshold" json:"failure_threshold"`
@@ -111,6 +122,7 @@ type Monitor struct {
 	statuses         map[string]*EndpointStatus
 	dailyMetrics     map[string]*EndpointMetrics
 	weeklyMetrics    map[string]*EndpointMetrics
+	alertClient      *http.Client
 	mu               sync.RWMutex
 }
 
@@ -171,6 +183,7 @@ func NewMonitor(config Config) *Monitor {
 		statuses:         make(map[string]*EndpointStatus),
 		dailyMetrics:     make(map[string]*EndpointMetrics),
 		weeklyMetrics:    make(map[string]*EndpointMetrics),
+		alertClient:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -533,11 +546,10 @@ func (m *Monitor) sendTelegram(chatID interface{}, message string) error {
 	if m.config.Telegram.BotToken == "" {
 		return nil
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
 	payload, _ := json.Marshal(map[string]interface{}{
 		"chat_id": chatID, "text": message, "parse_mode": "HTML",
 	})
-	resp, err := client.Post(
+	resp, err := m.alertClient.Post(
 		fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", m.config.Telegram.BotToken),
 		"application/json", bytes.NewReader(payload),
 	)
@@ -551,11 +563,90 @@ func (m *Monitor) sendTelegram(chatID interface{}, message string) error {
 func (m *Monitor) SendAlert(message string) {
 	if m.config.Telegram.ChatID == "" {
 		log.Printf("Alert: %s", message)
-		return
+	} else {
+		if err := m.sendTelegram(m.config.Telegram.ChatID, message); err != nil {
+			log.Printf("Failed to send Telegram alert: %v", err)
+		}
 	}
-	if err := m.sendTelegram(m.config.Telegram.ChatID, message); err != nil {
-		log.Printf("Failed to send alert: %v", err)
+
+	if err := m.sendSlackAlert(message); err != nil {
+		log.Printf("Failed to send Slack alert: %v", err)
 	}
+	if err := m.sendDiscordAlert(message); err != nil {
+		log.Printf("Failed to send Discord alert: %v", err)
+	}
+	if err := m.sendPagerDutyAlert(message); err != nil {
+		log.Printf("Failed to send PagerDuty alert: %v", err)
+	}
+}
+
+func (m *Monitor) sendSlackAlert(message string) error {
+	webhookURL := strings.TrimSpace(m.config.Notifications.Slack.WebhookURL)
+	if webhookURL == "" {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]string{"text": message})
+	if err != nil {
+		return err
+	}
+	resp, err := m.alertClient.Post(webhookURL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("slack webhook returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (m *Monitor) sendDiscordAlert(message string) error {
+	webhookURL := strings.TrimSpace(m.config.Notifications.Discord.WebhookURL)
+	if webhookURL == "" {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]string{"content": message})
+	if err != nil {
+		return err
+	}
+	resp, err := m.alertClient.Post(webhookURL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("discord webhook returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (m *Monitor) sendPagerDutyAlert(message string) error {
+	routingKey := strings.TrimSpace(m.config.Notifications.PagerDuty.RoutingKey)
+	if routingKey == "" {
+		return nil
+	}
+	payload := map[string]interface{}{
+		"routing_key":  routingKey,
+		"event_action": "trigger",
+		"payload": map[string]interface{}{
+			"summary":  message,
+			"source":   "pulse",
+			"severity": "error",
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	resp, err := m.alertClient.Post("https://events.pagerduty.com/v2/enqueue", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("pagerduty returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (m *Monitor) ensureMetrics(ep Endpoint) {

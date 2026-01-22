@@ -64,3 +64,16 @@ func TestNextWeeklyRun(t *testing.T) {
 		t.Fatalf("expected next Monday run, got %v", next)
 	}
 }
+
+func TestWebhookSendersSkipWhenUnset(t *testing.T) {
+	monitor := NewMonitor(Config{})
+	if err := monitor.sendSlackAlert("test"); err != nil {
+		t.Fatalf("expected slack sender to skip, got %v", err)
+	}
+	if err := monitor.sendDiscordAlert("test"); err != nil {
+		t.Fatalf("expected discord sender to skip, got %v", err)
+	}
+	if err := monitor.sendPagerDutyAlert("test"); err != nil {
+		t.Fatalf("expected pagerduty sender to skip, got %v", err)
+	}
+}

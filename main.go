@@ -658,7 +658,7 @@ func (m *Monitor) sendPagerDutyAlert(details AlertDetails) error {
 	if routingKey == "" {
 		return nil
 	}
-	if details.Kind == "summary" || details.Kind == "info" {
+	if details.Kind == "summary" || details.Kind == "info" || details.Kind == "slow" {
 		return nil
 	}
 

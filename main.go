@@ -590,9 +590,17 @@ type AlertDetails struct {
 
 var htmlTagPattern = regexp.MustCompile("<[^>]+>")
 var boldTagPattern = regexp.MustCompile(`<b>([^<]+)</b>`)
+var webhookFormatReplacer = strings.NewReplacer(
+	"<b>", "*",
+	"</b>", "*",
+	"<code>", "`",
+	"</code>", "`",
+)
 
 func parseAlertDetails(message string) AlertDetails {
 	plain := htmlTagPattern.ReplaceAllString(message, "")
+	formatted := webhookFormatReplacer.Replace(message)
+	formatted = htmlTagPattern.ReplaceAllString(formatted, "")
 	kind := "info"
 
 	if strings.Contains(message, "Summary") {
@@ -610,7 +618,12 @@ func parseAlertDetails(message string) AlertDetails {
 		endpoint = matches[1]
 	}
 
-	return AlertDetails{Kind: kind, EndpointName: endpoint, PlainMessage: plain}
+	plain = strings.TrimSpace(plain)
+	formatted = strings.TrimSpace(formatted)
+	if formatted == "" {
+		formatted = plain
+	}
+	return AlertDetails{Kind: kind, EndpointName: endpoint, PlainMessage: formatted}
 }
 
 func (m *Monitor) sendSlackAlert(message string) error {

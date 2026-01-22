@@ -1,19 +1,18 @@
-# 💓 Pulse
+# Pulse
 
 Lightweight endpoint monitoring with Telegram alerts. Single binary, zero dependencies.
 
-```
-pulse config.yaml
-```
-
 ## Features
 
-- 🔍 **Multi-protocol** - HTTP, JSON-RPC, gRPC, Tendermint, TCP ports
-- 📱 **Telegram alerts** - Instant down/up/slow notifications
-- ⚡ **Response tracking** - Monitor latency trends
-- 🔇 **Smart alerting** - Configurable failure threshold reduces noise
-- 📝 **YAML config** - Simple, readable configuration
-- 📦 **Single binary** - No runtime dependencies
+- **Multi-protocol** - HTTP, JSON-RPC, gRPC, Tendermint, TCP, WebSocket
+- **Flexible HTTP** - Any method, custom headers, request body, auth
+- **Response validation** - Status codes, body contains, regex, JSON path
+- **Authentication** - Basic auth, Bearer token
+- **TLS options** - Skip verification for self-signed certs
+- **Per-endpoint config** - Custom timeout, headers per endpoint
+- **Environment variables** - Use `${VAR}` syntax in config
+- **Telegram alerts** - Instant down/up/slow notifications
+- **Single binary** - No runtime dependencies
 
 ## Install
 
@@ -21,12 +20,10 @@ pulse config.yaml
 go install github.com/ajansari95/pulse@latest
 ```
 
-Or download from [releases](https://github.com/ajansari95/pulse/releases).
-
 ## Quick Start
 
 ```bash
-# 1. Create config
+# Create config
 cat > config.yaml << 'EOF'
 telegram:
   bot_token: ""
@@ -35,114 +32,178 @@ telegram:
 settings:
   check_interval: "60s"
   failure_threshold: 2
-  slow_threshold: "5s"
-
-endpoints:
-  - name: "API"
-    url: "https://api.example.com/health"
-    type: "http"
-EOF
-
-# 2. Set credentials (or add to config)
-export TELEGRAM_BOT_TOKEN="your-token"
-export TELEGRAM_CHAT_ID="your-chat-id"
-
-# 3. Run
-pulse config.yaml
-```
-
-## Configuration
-
-```yaml
-telegram:
-  bot_token: ""    # or TELEGRAM_BOT_TOKEN env
-  chat_id: ""      # or TELEGRAM_CHAT_ID env
-
-settings:
-  check_interval: "60s"      # how often to check
-  failure_threshold: 2       # alert after N consecutive failures
-  slow_threshold: "5s"       # alert if response exceeds this
-  port: "8080"               # health endpoint port
 
 endpoints:
   - name: "My API"
     url: "https://api.example.com/health"
     type: "http"
-    expected: 200
+EOF
 
-  - name: "Ethereum RPC"
+# Set credentials
+export TELEGRAM_BOT_TOKEN="your-token"
+export TELEGRAM_CHAT_ID="your-chat-id"
+
+# Run
+pulse config.yaml
+```
+
+## Configuration
+
+### Settings
+
+```yaml
+settings:
+  check_interval: "60s"      # How often to check
+  failure_threshold: 2       # Alert after N consecutive failures
+  slow_threshold: "5s"       # Alert if response exceeds this
+  timeout: "10s"             # Default request timeout
+  port: "8080"               # Health endpoint port
+```
+
+### HTTP Endpoints
+
+```yaml
+endpoints:
+  # Simple GET
+  - name: "API"
+    url: "https://api.example.com/health"
+    type: "http"
+
+  # POST with body and headers
+  - name: "API POST"
+    url: "https://api.example.com/check"
+    type: "http"
+    method: "POST"
+    content_type: "application/json"
+    body: '{"check": true}'
+    headers:
+      X-Custom: "value"
+
+  # Response validation
+  - name: "API Validated"
+    url: "https://api.example.com/status"
+    type: "http"
+    expected: 200
+    contains: "healthy"
+    json_path: "status"
+    json_path_value: "ok"
+
+  # Multiple valid status codes
+  - name: "Flexible API"
+    url: "https://api.example.com/endpoint"
+    type: "http"
+    expected_codes: [200, 201, 204]
+
+  # Regex match
+  - name: "Version"
+    url: "https://api.example.com/version"
+    type: "http"
+    match_regex: "v[0-9]+\\.[0-9]+"
+```
+
+### Authentication
+
+```yaml
+endpoints:
+  # Bearer token
+  - name: "Protected API"
+    url: "https://api.example.com/admin"
+    type: "http"
+    bearer_token: "${API_TOKEN}"
+
+  # Basic auth
+  - name: "Admin API"
+    url: "https://internal.example.com/admin"
+    type: "http"
+    basic_auth:
+      username: "${ADMIN_USER}"
+      password: "${ADMIN_PASS}"
+```
+
+### TLS Options
+
+```yaml
+endpoints:
+  - name: "Internal"
+    url: "https://internal.local:8443/health"
+    type: "http"
+    skip_tls_verify: true
+    timeout: "5s"
+```
+
+### Other Protocols
+
+```yaml
+endpoints:
+  # JSON-RPC (Ethereum, etc.)
+  - name: "Ethereum"
     url: "https://eth.example.com"
     type: "jsonrpc"
-    method: "eth_blockNumber"
+    rpc_method: "eth_blockNumber"
 
-  - name: "Cosmos RPC"
+  # Tendermint/Cosmos
+  - name: "Cosmos"
     url: "https://rpc.cosmos.example.com"
     type: "tendermint"
 
+  # gRPC
   - name: "gRPC Service"
     url: "grpc.example.com:443"
     type: "grpc"
 
+  # TCP port
   - name: "Database"
     url: "db.example.com"
     type: "port"
     port: 5432
+
+  # TCP direct
+  - name: "Redis"
+    url: "redis.example.com:6379"
+    type: "tcp"
+
+  # WebSocket
+  - name: "WS API"
+    url: "wss://ws.example.com/stream"
+    type: "websocket"
 ```
+
+## Environment Variables
+
+Use `${VAR}` in config - they expand at load time:
+
+```yaml
+endpoints:
+  - name: "API"
+    url: "${API_URL}/health"
+    bearer_token: "${API_TOKEN}"
+```
+
+Override settings via env:
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `CHECK_INTERVAL`
+- `PORT`
 
 ## Endpoint Types
 
-| Type | Description | Config |
-|------|-------------|--------|
-| `http` | HTTP GET | `url`, `expected` (default: 200) |
-| `jsonrpc` | JSON-RPC POST | `url`, `method` (default: eth_blockNumber) |
-| `tendermint` | Tendermint /status | `url` |
-| `grpc` | gRPC health check | `url` (host:port) |
-| `port` | TCP connect | `url` (host), `port` |
+| Type | Check Method |
+|------|--------------|
+| `http` | HTTP request with configurable method/headers/body |
+| `jsonrpc` | JSON-RPC 2.0 POST |
+| `tendermint` | Tendermint /status endpoint |
+| `grpc` | gRPC health check |
+| `port` / `tcp` | TCP connection |
+| `websocket` | TCP connection to WS endpoint |
 
 ## Telegram Setup
 
 1. Message [@BotFather](https://t.me/BotFather) → `/newbot`
 2. Copy the token
 3. Add bot to your channel/group as admin
-4. Get chat ID: forward message to [@userinfobot](https://t.me/userinfobot)
+4. Get chat ID: forward a message to [@userinfobot](https://t.me/userinfobot)
 
-### Commands
-
-Send `/status` in chat to get current status of all endpoints.
-
-## Deployment
-
-### Systemd
-
-```bash
-sudo tee /etc/systemd/system/pulse.service << EOF
-[Unit]
-Description=Pulse Monitor
-After=network.target
-
-[Service]
-Type=simple
-Environment=TELEGRAM_BOT_TOKEN=xxx
-Environment=TELEGRAM_CHAT_ID=xxx
-ExecStart=/usr/local/bin/pulse /etc/pulse/config.yaml
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl enable --now pulse
-```
-
-### Docker
-
-```bash
-docker run -d \
-  -e TELEGRAM_BOT_TOKEN="xxx" \
-  -e TELEGRAM_CHAT_ID="xxx" \
-  -v $(pwd)/config.yaml:/config.yaml \
-  ghcr.io/ajansari95/pulse
-```
+Send `/status` in chat to get current status.
 
 ## Health API
 
@@ -150,11 +211,16 @@ docker run -d \
 curl http://localhost:8080/health
 ```
 
-```json
-{
-  "API": {"up": true, "response_time_ms": 120, "last_check": "..."},
-  "Database": {"up": false, "last_error": "connection refused", "last_check": "..."}
-}
+Returns JSON with all endpoint statuses. Returns 503 if any endpoint is down.
+
+## Docker
+
+```bash
+docker run -d \
+  -e TELEGRAM_BOT_TOKEN="xxx" \
+  -e TELEGRAM_CHAT_ID="xxx" \
+  -v $(pwd)/config.yaml:/config.yaml \
+  ghcr.io/ajansari95/pulse
 ```
 
 ## License

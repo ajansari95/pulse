@@ -6,28 +6,89 @@ settings:
   check_interval: "60s"
   failure_threshold: 2
   slow_threshold: "5s"
+  timeout: "10s"
   port: "8080"
 
 endpoints:
-  - name: "Example API"
+  # Simple HTTP health check
+  - name: "API Health"
     url: "https://api.example.com/health"
     type: "http"
+
+  # HTTP with custom method and headers
+  - name: "API with Auth"
+    url: "https://api.example.com/v1/status"
+    type: "http"
+    method: "POST"
+    headers:
+      X-API-Version: "2.0"
+      Accept: "application/json"
+    bearer_token: "${API_TOKEN}"
     expected: 200
 
+  # HTTP with response body validation
+  - name: "API Status Check"
+    url: "https://api.example.com/status"
+    type: "http"
+    contains: "healthy"
+    json_path: "status"
+    json_path_value: "ok"
+
+  # Multiple valid status codes
+  - name: "API Flexible"
+    url: "https://api.example.com/endpoint"
+    type: "http"
+    expected_codes: [200, 201, 204]
+
+  # Basic auth
+  - name: "Protected API"
+    url: "https://internal.example.com/admin"
+    type: "http"
+    basic_auth:
+      username: "${ADMIN_USER}"
+      password: "${ADMIN_PASS}"
+
+  # Skip TLS verification (self-signed certs)
+  - name: "Internal Service"
+    url: "https://internal.local:8443/health"
+    type: "http"
+    skip_tls_verify: true
+    timeout: "5s"
+
+  # JSON-RPC (Ethereum)
   - name: "Ethereum RPC"
     url: "https://eth.example.com"
     type: "jsonrpc"
-    method: "eth_blockNumber"
+    rpc_method: "eth_blockNumber"
 
+  # Tendermint/Cosmos
   - name: "Cosmos RPC"
     url: "https://rpc.cosmos.example.com"
     type: "tendermint"
 
+  # gRPC health check
   - name: "gRPC Service"
     url: "grpc.example.com:443"
     type: "grpc"
 
+  # TCP port check
   - name: "Database"
     url: "db.example.com"
     type: "port"
     port: 5432
+
+  # Direct TCP (host:port format)
+  - name: "Redis"
+    url: "redis.example.com:6379"
+    type: "tcp"
+
+  # WebSocket endpoint
+  - name: "WebSocket API"
+    url: "wss://ws.example.com/stream"
+    type: "websocket"
+
+  # Regex validation
+  - name: "Version Check"
+    url: "https://api.example.com/version"
+    type: "http"
+    match_regex: "v[0-9]+\\.[0-9]+\\.[0-9]+"

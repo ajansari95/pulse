@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,6 +33,7 @@ type Config struct {
 		FailureThreshold int    `yaml:"failure_threshold" json:"failure_threshold"`
 		SlowThreshold    string `yaml:"slow_threshold" json:"slow_threshold"`
 		Port             string `yaml:"port" json:"port"`
+		Timeout          string `yaml:"timeout" json:"timeout"`
 	} `yaml:"settings" json:"settings"`
 	Endpoints []Endpoint `yaml:"endpoints" json:"endpoints"`
 }
@@ -39,10 +42,41 @@ type Endpoint struct {
 	Name       string `yaml:"name" json:"name"`
 	URL        string `yaml:"url" json:"url"`
 	DisplayURL string `yaml:"display_url,omitempty" json:"display_url,omitempty"`
-	Type       string `yaml:"type" json:"type"` // http, jsonrpc, tendermint, grpc, port
-	Port       int    `yaml:"port,omitempty" json:"port,omitempty"`
-	Expected   int    `yaml:"expected,omitempty" json:"expected,omitempty"`
-	Method     string `yaml:"method,omitempty" json:"method,omitempty"` // for jsonrpc
+	Type       string `yaml:"type" json:"type"` // http, jsonrpc, tendermint, grpc, port, tcp, websocket
+
+	// HTTP options
+	Method      string            `yaml:"method,omitempty" json:"method,omitempty"`             // GET, POST, PUT, DELETE, HEAD, OPTIONS
+	Headers     map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`           // Custom headers
+	Body        string            `yaml:"body,omitempty" json:"body,omitempty"`                 // Request body
+	ContentType string            `yaml:"content_type,omitempty" json:"content_type,omitempty"` // Content-Type header
+
+	// Response validation
+	Expected      int    `yaml:"expected,omitempty" json:"expected,omitempty"`               // Expected status code
+	ExpectedCodes []int  `yaml:"expected_codes,omitempty" json:"expected_codes,omitempty"`   // Multiple valid codes
+	Contains      string `yaml:"contains,omitempty" json:"contains,omitempty"`               // Response must contain
+	NotContains   string `yaml:"not_contains,omitempty" json:"not_contains,omitempty"`       // Response must NOT contain
+	MatchRegex    string `yaml:"match_regex,omitempty" json:"match_regex,omitempty"`         // Regex to match
+	JSONPath      string `yaml:"json_path,omitempty" json:"json_path,omitempty"`             // Simple JSON key check (e.g., "status" or "data.healthy")
+	JSONPathValue string `yaml:"json_path_value,omitempty" json:"json_path_value,omitempty"` // Expected value at JSON path
+
+	// Authentication
+	BasicAuth   *BasicAuth `yaml:"basic_auth,omitempty" json:"basic_auth,omitempty"`
+	BearerToken string     `yaml:"bearer_token,omitempty" json:"bearer_token,omitempty"`
+
+	// TLS/Connection options
+	SkipTLSVerify bool   `yaml:"skip_tls_verify,omitempty" json:"skip_tls_verify,omitempty"`
+	Timeout       string `yaml:"timeout,omitempty" json:"timeout,omitempty"` // Per-endpoint timeout
+
+	// Port check
+	Port int `yaml:"port,omitempty" json:"port,omitempty"`
+
+	// JSON-RPC specific (kept for backward compat)
+	RPCMethod string `yaml:"rpc_method,omitempty" json:"rpc_method,omitempty"`
+}
+
+type BasicAuth struct {
+	Username string `yaml:"username" json:"username"`
+	Password string `yaml:"password" json:"password"`
 }
 
 type EndpointStatus struct {
@@ -60,9 +94,9 @@ type Monitor struct {
 	checkInterval    time.Duration
 	failureThreshold int
 	slowThreshold    time.Duration
+	defaultTimeout   time.Duration
 	statuses         map[string]*EndpointStatus
 	mu               sync.RWMutex
-	httpClient       *http.Client
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -70,8 +104,10 @@ func LoadConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Expand environment variables in config
+	expanded := os.ExpandEnv(string(data))
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
 		return nil, err
 	}
 	cfg.applyEnvOverrides()
@@ -106,46 +142,178 @@ func NewMonitor(config Config) *Monitor {
 	if failureThreshold == 0 {
 		failureThreshold = 2
 	}
+	defaultTimeout, _ := time.ParseDuration(config.Settings.Timeout)
+	if defaultTimeout == 0 {
+		defaultTimeout = 10 * time.Second
+	}
 
 	return &Monitor{
 		config:           config,
 		checkInterval:    checkInterval,
 		failureThreshold: failureThreshold,
 		slowThreshold:    slowThreshold,
+		defaultTimeout:   defaultTimeout,
 		statuses:         make(map[string]*EndpointStatus),
-		httpClient: &http.Client{
-			Timeout:   10 * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{}},
+	}
+}
+
+func (m *Monitor) createHTTPClient(ep Endpoint) *http.Client {
+	timeout := m.defaultTimeout
+	if ep.Timeout != "" {
+		if t, err := time.ParseDuration(ep.Timeout); err == nil {
+			timeout = t
+		}
+	}
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: ep.SkipTLSVerify,
+	}
+
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
 		},
 	}
 }
 
 func (m *Monitor) CheckHTTP(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
 	start := time.Now()
-	req, err := http.NewRequestWithContext(ctx, "GET", ep.URL, nil)
+	client := m.createHTTPClient(ep)
+
+	method := strings.ToUpper(ep.Method)
+	if method == "" {
+		method = "GET"
+	}
+
+	var body *bytes.Reader
+	if ep.Body != "" {
+		body = bytes.NewReader([]byte(ep.Body))
+	} else {
+		body = bytes.NewReader(nil)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, ep.URL, body)
 	if err != nil {
 		return false, fmt.Sprintf("request error: %v", err), 0
 	}
-	resp, err := m.httpClient.Do(req)
+
+	// Set headers
+	for k, v := range ep.Headers {
+		req.Header.Set(k, v)
+	}
+	if ep.ContentType != "" {
+		req.Header.Set("Content-Type", ep.ContentType)
+	}
+
+	// Set auth
+	if ep.BasicAuth != nil {
+		req.SetBasicAuth(ep.BasicAuth.Username, ep.BasicAuth.Password)
+	}
+	if ep.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+ep.BearerToken)
+	}
+
+	resp, err := client.Do(req)
 	elapsed := time.Since(start)
 	if err != nil {
 		return false, fmt.Sprintf("failed: %v", err), elapsed
 	}
 	defer resp.Body.Close()
 
-	expected := ep.Expected
-	if expected == 0 {
-		expected = 200
+	// Check status code
+	expectedCodes := ep.ExpectedCodes
+	if len(expectedCodes) == 0 {
+		expected := ep.Expected
+		if expected == 0 {
+			expected = 200
+		}
+		expectedCodes = []int{expected}
 	}
-	if resp.StatusCode != expected {
-		return false, fmt.Sprintf("status %d (expected %d)", resp.StatusCode, expected), elapsed
+
+	statusOK := false
+	for _, code := range expectedCodes {
+		if resp.StatusCode == code {
+			statusOK = true
+			break
+		}
 	}
+	if !statusOK {
+		return false, fmt.Sprintf("status %d (expected %v)", resp.StatusCode, expectedCodes), elapsed
+	}
+
+	// Read body for validation
+	if ep.Contains != "" || ep.NotContains != "" || ep.MatchRegex != "" || ep.JSONPath != "" {
+		bodyBytes := make([]byte, 1024*1024) // 1MB max
+		n, _ := resp.Body.Read(bodyBytes)
+		bodyStr := string(bodyBytes[:n])
+
+		if ep.Contains != "" && !strings.Contains(bodyStr, ep.Contains) {
+			return false, fmt.Sprintf("response missing '%s'", ep.Contains), elapsed
+		}
+		if ep.NotContains != "" && strings.Contains(bodyStr, ep.NotContains) {
+			return false, fmt.Sprintf("response contains forbidden '%s'", ep.NotContains), elapsed
+		}
+		if ep.MatchRegex != "" {
+			matched, err := regexp.MatchString(ep.MatchRegex, bodyStr)
+			if err != nil {
+				return false, fmt.Sprintf("regex error: %v", err), elapsed
+			}
+			if !matched {
+				return false, fmt.Sprintf("response doesn't match regex '%s'", ep.MatchRegex), elapsed
+			}
+		}
+		if ep.JSONPath != "" {
+			if ok, errMsg := m.checkJSONPath(bodyStr, ep.JSONPath, ep.JSONPathValue); !ok {
+				return false, errMsg, elapsed
+			}
+		}
+	}
+
 	return true, "", elapsed
+}
+
+func (m *Monitor) checkJSONPath(body, path, expectedValue string) (bool, string) {
+	var data interface{}
+	if err := json.Unmarshal([]byte(body), &data); err != nil {
+		return false, fmt.Sprintf("invalid JSON: %v", err)
+	}
+
+	// Simple dot-notation path traversal
+	parts := strings.Split(path, ".")
+	current := data
+
+	for _, part := range parts {
+		switch v := current.(type) {
+		case map[string]interface{}:
+			var ok bool
+			current, ok = v[part]
+			if !ok {
+				return false, fmt.Sprintf("JSON path '%s' not found (missing '%s')", path, part)
+			}
+		default:
+			return false, fmt.Sprintf("JSON path '%s' not found (cannot traverse '%s')", path, part)
+		}
+	}
+
+	if expectedValue != "" {
+		actualValue := fmt.Sprintf("%v", current)
+		if actualValue != expectedValue {
+			return false, fmt.Sprintf("JSON '%s' = '%s' (expected '%s')", path, actualValue, expectedValue)
+		}
+	}
+
+	return true, ""
 }
 
 func (m *Monitor) CheckJSONRPC(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
 	start := time.Now()
-	method := ep.Method
+	client := m.createHTTPClient(ep)
+
+	method := ep.RPCMethod
+	if method == "" {
+		method = ep.Method // backward compat
+	}
 	if method == "" {
 		method = "eth_blockNumber"
 	}
@@ -157,7 +325,15 @@ func (m *Monitor) CheckJSONRPC(ctx context.Context, ep Endpoint) (bool, string, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := m.httpClient.Do(req)
+	// Set custom headers and auth
+	for k, v := range ep.Headers {
+		req.Header.Set(k, v)
+	}
+	if ep.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+ep.BearerToken)
+	}
+
+	resp, err := client.Do(req)
 	elapsed := time.Since(start)
 	if err != nil {
 		return false, fmt.Sprintf("failed: %v", err), elapsed
@@ -183,11 +359,19 @@ func (m *Monitor) CheckJSONRPC(ctx context.Context, ep Endpoint) (bool, string, 
 
 func (m *Monitor) CheckTendermint(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
 	start := time.Now()
-	req, err := http.NewRequestWithContext(ctx, "GET", ep.URL+"/status", nil)
+	client := m.createHTTPClient(ep)
+
+	url := strings.TrimSuffix(ep.URL, "/") + "/status"
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false, fmt.Sprintf("request error: %v", err), 0
 	}
-	resp, err := m.httpClient.Do(req)
+
+	for k, v := range ep.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(req)
 	elapsed := time.Since(start)
 	if err != nil {
 		return false, fmt.Sprintf("failed: %v", err), elapsed
@@ -210,10 +394,26 @@ func (m *Monitor) CheckTendermint(ctx context.Context, ep Endpoint) (bool, strin
 
 func (m *Monitor) CheckGRPC(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
 	start := time.Now()
-	conn, err := grpc.DialContext(ctx, ep.URL,
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
-		grpc.WithBlock(),
-	)
+
+	timeout := m.defaultTimeout
+	if ep.Timeout != "" {
+		if t, err := time.ParseDuration(ep.Timeout); err == nil {
+			timeout = t
+		}
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var opts []grpc.DialOption
+	if ep.SkipTLSVerify {
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})))
+	}
+	opts = append(opts, grpc.WithBlock())
+
+	conn, err := grpc.DialContext(dialCtx, ep.URL, opts...)
 	elapsed := time.Since(start)
 	if err != nil {
 		return false, fmt.Sprintf("connection failed: %v", err), elapsed
@@ -223,7 +423,7 @@ func (m *Monitor) CheckGRPC(ctx context.Context, ep Endpoint) (bool, string, tim
 	client := grpc_health_v1.NewHealthClient(conn)
 	resp, err := client.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
 	if err != nil {
-		return true, "", elapsed
+		return true, "", elapsed // Connection worked, health not implemented
 	}
 	if resp.Status != grpc_health_v1.HealthCheckResponse_SERVING {
 		return false, fmt.Sprintf("not serving: %v", resp.Status), elapsed
@@ -233,7 +433,57 @@ func (m *Monitor) CheckGRPC(ctx context.Context, ep Endpoint) (bool, string, tim
 
 func (m *Monitor) CheckPort(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
 	start := time.Now()
-	conn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", ep.URL, ep.Port))
+
+	timeout := m.defaultTimeout
+	if ep.Timeout != "" {
+		if t, err := time.ParseDuration(ep.Timeout); err == nil {
+			timeout = t
+		}
+	}
+
+	address := ep.URL
+	if ep.Port > 0 {
+		address = fmt.Sprintf("%s:%d", ep.URL, ep.Port)
+	}
+
+	conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", address)
+	elapsed := time.Since(start)
+	if err != nil {
+		return false, fmt.Sprintf("unreachable: %v", err), elapsed
+	}
+	conn.Close()
+	return true, "", elapsed
+}
+
+func (m *Monitor) CheckTCP(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
+	return m.CheckPort(ctx, ep)
+}
+
+func (m *Monitor) CheckWebSocket(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
+	start := time.Now()
+
+	timeout := m.defaultTimeout
+	if ep.Timeout != "" {
+		if t, err := time.ParseDuration(ep.Timeout); err == nil {
+			timeout = t
+		}
+	}
+
+	// For websocket, just check if we can establish TCP connection to the host
+	url := ep.URL
+	url = strings.TrimPrefix(url, "wss://")
+	url = strings.TrimPrefix(url, "ws://")
+
+	// Add default port if missing
+	if !strings.Contains(url, ":") {
+		if strings.HasPrefix(ep.URL, "wss://") {
+			url = url + ":443"
+		} else {
+			url = url + ":80"
+		}
+	}
+
+	conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", url)
 	elapsed := time.Since(start)
 	if err != nil {
 		return false, fmt.Sprintf("unreachable: %v", err), elapsed
@@ -243,19 +493,22 @@ func (m *Monitor) CheckPort(ctx context.Context, ep Endpoint) (bool, string, tim
 }
 
 func (m *Monitor) CheckEndpoint(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
-	switch ep.Type {
-	case "http":
+	switch strings.ToLower(ep.Type) {
+	case "http", "https", "":
 		return m.CheckHTTP(ctx, ep)
-	case "jsonrpc":
+	case "jsonrpc", "json-rpc":
 		return m.CheckJSONRPC(ctx, ep)
-	case "tendermint":
+	case "tendermint", "cosmos":
 		return m.CheckTendermint(ctx, ep)
 	case "grpc":
 		return m.CheckGRPC(ctx, ep)
-	case "port":
+	case "port", "tcp":
 		return m.CheckPort(ctx, ep)
+	case "websocket", "ws", "wss":
+		return m.CheckWebSocket(ctx, ep)
 	default:
-		return false, fmt.Sprintf("unknown type: %s", ep.Type), 0
+		// Default to HTTP for any URL
+		return m.CheckHTTP(ctx, ep)
 	}
 }
 
@@ -263,10 +516,11 @@ func (m *Monitor) sendTelegram(chatID interface{}, message string) error {
 	if m.config.Telegram.BotToken == "" {
 		return nil
 	}
+	client := &http.Client{Timeout: 10 * time.Second}
 	payload, _ := json.Marshal(map[string]interface{}{
 		"chat_id": chatID, "text": message, "parse_mode": "HTML",
 	})
-	resp, err := m.httpClient.Post(
+	resp, err := client.Post(
 		fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", m.config.Telegram.BotToken),
 		"application/json", bytes.NewReader(payload),
 	)
@@ -331,6 +585,7 @@ func (m *Monitor) PollTelegramCommands(ctx context.Context) {
 	if m.config.Telegram.BotToken == "" {
 		return
 	}
+	client := &http.Client{Timeout: 10 * time.Second}
 	var lastUpdateID int64
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -340,7 +595,7 @@ func (m *Monitor) PollTelegramCommands(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			resp, err := m.httpClient.Get(fmt.Sprintf(
+			resp, err := client.Get(fmt.Sprintf(
 				"https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=1",
 				m.config.Telegram.BotToken, lastUpdateID+1,
 			))
@@ -407,7 +662,15 @@ func (m *Monitor) checkAll(ctx context.Context) {
 		wg.Add(1)
 		go func(ep Endpoint) {
 			defer wg.Done()
-			checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+
+			timeout := m.defaultTimeout + 5*time.Second
+			if ep.Timeout != "" {
+				if t, err := time.ParseDuration(ep.Timeout); err == nil {
+					timeout = t + 5*time.Second
+				}
+			}
+
+			checkCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
 			isUp, errMsg, responseTime := m.CheckEndpoint(checkCtx, ep)
@@ -532,7 +795,7 @@ func main() {
 	go monitor.Run(ctx)
 	go monitor.PollTelegramCommands(ctx)
 
-	startupMsg := fmt.Sprintf("🚀 <b>Endpoint Monitor Started</b>\n\n%d endpoints, interval: %s\n\n", len(config.Endpoints), monitor.checkInterval)
+	startupMsg := fmt.Sprintf("🚀 <b>Pulse Monitor Started</b>\n\n%d endpoints, interval: %s\n\n", len(config.Endpoints), monitor.checkInterval)
 	for _, ep := range config.Endpoints {
 		startupMsg += fmt.Sprintf("• %s (%s)\n", ep.Name, monitor.getDisplayURL(ep))
 	}

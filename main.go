@@ -643,8 +643,9 @@ func formatDuration(duration time.Duration) string {
 }
 
 func (m *Monitor) buildSummaryMessage(label string, metrics map[string]*EndpointMetrics) string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	if len(m.statuses) == 0 {
+		return ""
+	}
 
 	if len(m.statuses) == 0 {
 		return ""

@@ -1,0 +1,33 @@
+telegram:
+  bot_token: ""  # or use TELEGRAM_BOT_TOKEN env var
+  chat_id: ""    # or use TELEGRAM_CHAT_ID env var
+
+settings:
+  check_interval: "60s"
+  failure_threshold: 2
+  slow_threshold: "5s"
+  port: "8080"
+
+endpoints:
+  - name: "Example API"
+    url: "https://api.example.com/health"
+    type: "http"
+    expected: 200
+
+  - name: "Ethereum RPC"
+    url: "https://eth.example.com"
+    type: "jsonrpc"
+    method: "eth_blockNumber"
+
+  - name: "Cosmos RPC"
+    url: "https://rpc.cosmos.example.com"
+    type: "tendermint"
+
+  - name: "gRPC Service"
+    url: "grpc.example.com:443"
+    type: "grpc"
+
+  - name: "Database"
+    url: "db.example.com"
+    type: "port"
+    port: 5432

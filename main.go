@@ -168,6 +168,7 @@ type RegionReport struct {
 
 type Monitor struct {
 	config           Config
+	configPath       string
 	checkInterval    time.Duration
 	failureThreshold int
 	slowThreshold    time.Duration
@@ -194,6 +195,7 @@ type Monitor struct {
 	aggregateStatus  map[string]bool
 	regionLastReport map[string]time.Time
 	reportStaleAfter time.Duration
+	configHash       uint64
 	alertClient      *http.Client
 	mu               sync.RWMutex
 }
@@ -211,6 +213,33 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	cfg.applyEnvOverrides()
 	return &cfg, nil
+}
+
+func LoadConfigWithHash(path string) (*Config, uint64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	expanded := os.ExpandEnv(string(data))
+	var cfg Config
+	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
+		return nil, 0, err
+	}
+	cfg.applyEnvOverrides()
+	return &cfg, fnv64a([]byte(expanded)), nil
+}
+
+func fnv64a(data []byte) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	var hash uint64 = offset64
+	for _, value := range data {
+		hash ^= uint64(value)
+		hash *= prime64
+	}
+	return hash
 }
 
 func (c *Config) applyEnvOverrides() {
@@ -255,7 +284,7 @@ func (c *Config) applyEnvOverrides() {
 	}
 }
 
-func NewMonitor(config Config) *Monitor {
+func NewMonitor(config Config, configPath string, configHash uint64) *Monitor {
 	checkInterval, _ := time.ParseDuration(config.Settings.CheckInterval)
 	if checkInterval == 0 {
 		checkInterval = 60 * time.Second
@@ -293,6 +322,7 @@ func NewMonitor(config Config) *Monitor {
 
 	return &Monitor{
 		config:           config,
+		configPath:       configPath,
 		checkInterval:    checkInterval,
 		failureThreshold: failureThreshold,
 		slowThreshold:    slowThreshold,
@@ -320,6 +350,7 @@ func NewMonitor(config Config) *Monitor {
 		regionLastReport: make(map[string]time.Time),
 		reportStaleAfter: reportStaleAfter,
 		alertClient:      &http.Client{Timeout: 10 * time.Second},
+		configHash:       configHash,
 	}
 }
 
@@ -1565,6 +1596,12 @@ func (m *Monitor) PollTelegramCommands(ctx context.Context) {
 				case text == "/status":
 					m.sendTelegram(chatID, m.GenerateStatusMessage())
 					log.Printf("Responded to /status from %d", chatID)
+				case text == "/reload":
+					if err := m.ReloadConfig("telegram"); err != nil {
+						m.sendTelegram(chatID, fmt.Sprintf("Reload failed: %v", err))
+						continue
+					}
+					m.sendTelegram(chatID, "Config reloaded")
 				case strings.HasPrefix(text, "/mute "):
 					parts := strings.Fields(text)
 					if len(parts) < 3 {
@@ -1853,6 +1890,197 @@ func (m *Monitor) BuildRegionReport() RegionReport {
 	return RegionReport{Region: m.region, Statuses: statuses}
 }
 
+func (m *Monitor) ReloadConfig(trigger string) error {
+	config, hash, err := LoadConfigWithHash(m.configPath)
+	if err != nil {
+		return err
+	}
+	if hash == m.configHash {
+		return nil
+	}
+
+	checkInterval, _ := time.ParseDuration(config.Settings.CheckInterval)
+	if checkInterval == 0 {
+		checkInterval = 60 * time.Second
+	}
+	slowThreshold, _ := time.ParseDuration(config.Settings.SlowThreshold)
+	if slowThreshold == 0 {
+		slowThreshold = 5 * time.Second
+	}
+	failureThreshold := config.Settings.FailureThreshold
+	if failureThreshold == 0 {
+		failureThreshold = 2
+	}
+	defaultTimeout, _ := time.ParseDuration(config.Settings.Timeout)
+	if defaultTimeout == 0 {
+		defaultTimeout = 10 * time.Second
+	}
+
+	region := strings.TrimSpace(config.Settings.Region)
+	if region == "" {
+		region = "default"
+	}
+	regionsRequired := config.Settings.RegionsRequired
+	if regionsRequired == 0 {
+		regionsRequired = 2
+	}
+	reportStaleAfter := 2 * checkInterval
+	if config.Settings.ReportStaleAfter != "" {
+		if parsed, err := time.ParseDuration(config.Settings.ReportStaleAfter); err == nil {
+			reportStaleAfter = parsed
+		}
+	}
+	if reportStaleAfter <= 0 {
+		reportStaleAfter = 2 * checkInterval
+	}
+
+	newStatuses := make(map[string]*EndpointStatus)
+	for _, ep := range config.Endpoints {
+			newStatus := &EndpointStatus{
+				Endpoint:       ep,
+				IsUp:           existing.IsUp,
+				LastCheck:      existing.LastCheck,
+				LastError:      existing.LastError,
+				ResponseTime:   existing.ResponseTime,
+				Consecutive:    existing.Consecutive,
+				DownSince:      existing.DownSince,
+				ConsecFailures: existing.ConsecFailures,
+			}
+			newStatuses[ep.Name] = newStatus
+			continue
+		}
+		newStatuses[ep.Name] = &EndpointStatus{Endpoint: ep, IsUp: true}
+	}
+
+	newDaily := make(map[string]*EndpointMetrics)
+	newWeekly := make(map[string]*EndpointMetrics)
+	newHistory := make(map[string][]HistoryPoint)
+	newChecks := make(map[string]int)
+	newFailures := make(map[string]int)
+	newExpiry := make(map[string]time.Time)
+	newWarn := make(map[string]time.Time)
+	newRegions := make(map[string]map[string]RegionStatus)
+	newAggregate := make(map[string]bool)
+	newLastReport := make(map[string]time.Time)
+
+	for _, ep := range config.Endpoints {
+		if metric, ok := m.dailyMetrics[ep.Name]; ok {
+			newDaily[ep.Name] = metric
+		} else {
+			newDaily[ep.Name] = &EndpointMetrics{}
+		}
+		if metric, ok := m.weeklyMetrics[ep.Name]; ok {
+			newWeekly[ep.Name] = metric
+		} else {
+			newWeekly[ep.Name] = &EndpointMetrics{}
+		}
+		if history, ok := m.history[ep.Name]; ok {
+			newHistory[ep.Name] = history
+		} else {
+			newHistory[ep.Name] = []HistoryPoint{}
+		}
+		newChecks[ep.Name] = m.totalChecks[ep.Name]
+		newFailures[ep.Name] = m.totalFailures[ep.Name]
+		newExpiry[ep.Name] = m.sslExpiry[ep.Name]
+		newWarn[ep.Name] = m.sslLastWarn[ep.Name]
+		if regionStatus, ok := m.regionReports[ep.Name]; ok {
+			newRegions[ep.Name] = regionStatus
+		}
+		newAggregate[ep.Name] = m.aggregateStatus[ep.Name]
+	}
+	for regionName, lastSeen := range m.regionLastReport {
+		newLastReport[regionName] = lastSeen
+	}
+
+	removed := []string{}
+	for name := range m.statuses {
+		if _, ok := newStatuses[name]; !ok {
+			removed = append(removed, name)
+		}
+	}
+	added := []string{}
+	for name := range newStatuses {
+		if _, ok := m.statuses[name]; !ok {
+			added = append(added, name)
+		}
+	}
+
+	m.mu.Lock()
+	m.config = *config
+	m.checkInterval = checkInterval
+	m.slowThreshold = slowThreshold
+	m.failureThreshold = failureThreshold
+	m.defaultTimeout = defaultTimeout
+	m.region = region
+	m.coordinatorURL = strings.TrimSpace(config.Settings.CoordinatorURL)
+	m.regionsRequired = regionsRequired
+	m.regionAlerts = config.Settings.RegionAlerts
+	m.reportStaleAfter = reportStaleAfter
+	m.statuses = newStatuses
+	m.dailyMetrics = newDaily
+	m.weeklyMetrics = newWeekly
+	m.history = newHistory
+	m.totalChecks = newChecks
+	m.totalFailures = newFailures
+	m.sslExpiry = newExpiry
+	m.sslLastWarn = newWarn
+	m.regionReports = newRegions
+	m.aggregateStatus = newAggregate
+	m.regionLastReport = newLastReport
+	m.configHash = hash
+	m.mu.Unlock()
+
+	log.Printf("Config reloaded via %s. Added endpoints: %v, removed endpoints: %v", trigger, added, removed)
+	return nil
+}
+
+func (m *Monitor) reloadHandler(trigger string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := m.ReloadConfig(trigger); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (m *Monitor) watchConfig(ctx context.Context) {
+	if m.configPath == "" {
+		return
+	}
+	info, err := os.Stat(m.configPath)
+	if err != nil {
+		log.Printf("Config watch disabled: %v", err)
+		return
+	}
+	lastMod := info.ModTime()
+	lastSize := info.Size()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := os.Stat(m.configPath)
+			if err != nil {
+				continue
+			}
+			if info.ModTime().Equal(lastMod) && info.Size() == lastSize {
+				continue
+			}
+			lastMod = info.ModTime()
+			lastSize = info.Size()
+			if err := m.ReloadConfig("watcher"); err != nil {
+				log.Printf("Config reload failed: %v", err)
+			}
+		}
+	}
+}
+
 func (m *Monitor) SendRegionReport(ctx context.Context) {
 	if m.coordinatorURL == "" {
 		return
@@ -2002,12 +2230,12 @@ func main() {
 		configPath = os.Args[1]
 	}
 
-	config, err := LoadConfig(configPath)
+	config, configHash, err := LoadConfigWithHash(configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	monitor := NewMonitor(*config)
+	monitor := NewMonitor(*config, configPath, configHash)
 
 	port := config.Settings.Port
 	if port == "" {
@@ -2018,6 +2246,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", monitor.HealthHandler())
 	mux.HandleFunc("/status", monitor.HealthHandler())
+	mux.HandleFunc("/reload", monitor.reloadHandler("api"))
 	mux.HandleFunc("/report", monitor.RegionReportHandler())
 	if metricsPort == "" || metricsPort == port {
 		mux.HandleFunc("/metrics", monitor.MetricsHandler())
@@ -2060,19 +2289,30 @@ func main() {
 
 	go func() {
 		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan
-		log.Println("Shutting down...")
-		cancel()
-		server.Shutdown(context.Background())
-		if metricsServer != nil {
-			metricsServer.Shutdown(context.Background())
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		for {
+			sig := <-sigChan
+			switch sig {
+			case syscall.SIGHUP:
+				if err := monitor.ReloadConfig("sighup"); err != nil {
+					log.Printf("Config reload failed: %v", err)
+				}
+			case syscall.SIGINT, syscall.SIGTERM:
+				log.Println("Shutting down...")
+				cancel()
+				server.Shutdown(context.Background())
+				if metricsServer != nil {
+					metricsServer.Shutdown(context.Background())
+				}
+				return
+			}
 		}
 	}()
 
 	go monitor.Run(ctx)
 	go monitor.PollTelegramCommands(ctx)
 	go monitor.ScheduleSummaryReports(ctx)
+	go monitor.watchConfig(ctx)
 
 	startupMsg := fmt.Sprintf("🚀 <b>Pulse Monitor Started</b>\n\n%d endpoints, interval: %s\n\n", len(config.Endpoints), monitor.checkInterval)
 	for _, ep := range config.Endpoints {

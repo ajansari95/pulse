@@ -74,7 +74,6 @@ settings:
   daily_summary: "09:00"     # Daily summary time (local)
   weekly_summary: "monday 09:00" # Weekly summary schedule (local)
   public_dashboard: true      # Enable the web dashboard
-  public_dashboard: true      # Enable the web dashboard
 ```
 
 ### HTTP Endpoints

@@ -637,9 +637,8 @@ func (m *Monitor) CheckSSL(ctx context.Context, ep Endpoint) (bool, string, time
 	}
 
 	conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", host)
-	elapsed := time.Since(start)
 	if err != nil {
-		return false, fmt.Sprintf("dial failed: %v", err), elapsed
+		return false, fmt.Sprintf("dial failed: %v", err), time.Since(start)
 	}
 	defer conn.Close()
 
@@ -647,11 +646,11 @@ func (m *Monitor) CheckSSL(ctx context.Context, ep Endpoint) (bool, string, time
 	defer tlsConn.Close()
 	_ = tlsConn.SetDeadline(time.Now().Add(timeout))
 	if err := tlsConn.Handshake(); err != nil {
-		return false, fmt.Sprintf("tls handshake failed: %v", err), elapsed
+		return false, fmt.Sprintf("tls handshake failed: %v", err), time.Since(start)
 	}
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
-		return false, "no peer certificates", elapsed
+		return false, "no peer certificates", time.Since(start)
 	}
 
 	expiry := state.PeerCertificates[0].NotAfter
@@ -668,12 +667,12 @@ func (m *Monitor) CheckSSL(ctx context.Context, ep Endpoint) (bool, string, time
 	}
 
 	if expiry.Before(now) {
-		return false, fmt.Sprintf("certificate expired %d days ago", -daysLeft), elapsed
+		return false, fmt.Sprintf("certificate expired %d days ago", -daysLeft), time.Since(start)
 	}
 	if daysLeft <= criticalDays {
-		return false, fmt.Sprintf("certificate expires in %d days", daysLeft), elapsed
+		return false, fmt.Sprintf("certificate expires in %d days", daysLeft), time.Since(start)
 	}
-	return true, "", elapsed
+	return true, "", time.Since(start)
 }
 
 func (m *Monitor) CheckEndpoint(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {

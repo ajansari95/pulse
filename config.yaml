@@ -24,6 +24,7 @@ settings:
   coordinator_url: ""
   regions_required: 2
   region_alerts: false
+  report_stale_after: "5m"
 
 endpoints:
   # Simple HTTP health check

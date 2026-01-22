@@ -62,6 +62,7 @@ type Config struct {
 		CoordinatorURL   string `yaml:"coordinator_url" json:"coordinator_url"`
 		RegionsRequired  int    `yaml:"regions_required" json:"regions_required"`
 		RegionAlerts     bool   `yaml:"region_alerts" json:"region_alerts"`
+		ReportStaleAfter string `yaml:"report_stale_after" json:"report_stale_after"`
 	} `yaml:"settings" json:"settings"`
 	Endpoints   []Endpoint          `yaml:"endpoints" json:"endpoints"`
 	Maintenance []MaintenanceWindow `yaml:"maintenance" json:"maintenance"`
@@ -191,6 +192,8 @@ type Monitor struct {
 	regionAlerts     bool
 	regionReports    map[string]map[string]RegionStatus
 	aggregateStatus  map[string]bool
+	regionLastReport map[string]time.Time
+	reportStaleAfter time.Duration
 	alertClient      *http.Client
 	mu               sync.RWMutex
 }
@@ -242,6 +245,9 @@ func (c *Config) applyEnvOverrides() {
 			c.Settings.RegionAlerts = parsed
 		}
 	}
+	if v := os.Getenv("REPORT_STALE_AFTER"); v != "" {
+		c.Settings.ReportStaleAfter = v
+	}
 	if v := os.Getenv("PUBLIC_DASHBOARD"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.Settings.PublicDashboard = &parsed
@@ -275,6 +281,15 @@ func NewMonitor(config Config) *Monitor {
 	if regionsRequired == 0 {
 		regionsRequired = 2
 	}
+	reportStaleAfter := 2 * checkInterval
+	if config.Settings.ReportStaleAfter != "" {
+		if parsed, err := time.ParseDuration(config.Settings.ReportStaleAfter); err == nil {
+			reportStaleAfter = parsed
+		}
+	}
+	if reportStaleAfter <= 0 {
+		reportStaleAfter = 2 * checkInterval
+	}
 
 	return &Monitor{
 		config:           config,
@@ -302,6 +317,8 @@ func NewMonitor(config Config) *Monitor {
 		regionAlerts:     config.Settings.RegionAlerts,
 		regionReports:    make(map[string]map[string]RegionStatus),
 		aggregateStatus:  make(map[string]bool),
+		regionLastReport: make(map[string]time.Time),
+		reportStaleAfter: reportStaleAfter,
 		alertClient:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -1879,7 +1896,10 @@ func (m *Monitor) RegionReportHandler() http.HandlerFunc {
 			report.Region = "unknown"
 		}
 
+		now := time.Now()
+		alerts := []string{}
 		m.mu.Lock()
+		m.regionLastReport[report.Region] = now
 		for endpoint, status := range report.Statuses {
 			regions := m.regionReports[endpoint]
 			if regions == nil {
@@ -1895,28 +1915,43 @@ func (m *Monitor) RegionReportHandler() http.HandlerFunc {
 				}
 				message := fmt.Sprintf("🌍 <b>%s</b> %s in %s\n\nEndpoint: <code>%s</code>",
 					endpoint, state, report.Region, endpoint)
-				m.mu.Unlock()
-				m.SendAlert(message)
-				m.mu.Lock()
+				alerts = append(alerts, message)
 			}
 		}
-		m.evaluateAggregatesLocked()
+		alerts = append(alerts, m.evaluateAggregatesLocked(now)...)
 		m.mu.Unlock()
+		for _, message := range alerts {
+			m.SendAlert(message)
+		}
 
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
-func (m *Monitor) evaluateAggregatesLocked() {
+func (m *Monitor) evaluateAggregatesLocked(now time.Time) []string {
+	alerts := []string{}
 	if m.regionsRequired <= 1 {
-		return
+		return alerts
 	}
 	for endpoint, regions := range m.regionReports {
 		downRegions := []string{}
+		activeRegions := 0
 		for regionName, status := range regions {
+			lastReport := m.regionLastReport[regionName]
+			if lastReport.IsZero() || now.Sub(lastReport) > m.reportStaleAfter {
+				delete(regions, regionName)
+				continue
+			}
+			activeRegions++
 			if !status.Up {
 				downRegions = append(downRegions, regionName)
 			}
+		}
+		if activeRegions == 0 {
+			continue
+		}
+		if activeRegions < m.regionsRequired {
+			continue
 		}
 		aggregatedDown := len(downRegions) >= m.regionsRequired
 		previous, hadPrevious := m.aggregateStatus[endpoint]
@@ -1931,11 +1966,10 @@ func (m *Monitor) evaluateAggregatesLocked() {
 			icon = "🔴"
 		}
 		message := fmt.Sprintf("%s <b>%s</b> is %s in %d/%d regions\n\nEndpoint: <code>%s</code>\nRegions: %s",
-			icon, endpoint, state, len(downRegions), len(regions), endpoint, strings.Join(downRegions, ", "))
-		m.mu.Unlock()
-		m.SendAlert(message)
-		m.mu.Lock()
+			icon, endpoint, state, len(downRegions), activeRegions, endpoint, strings.Join(downRegions, ", "))
+		alerts = append(alerts, message)
 	}
+	return alerts
 }
 
 func (m *Monitor) HealthHandler() http.HandlerFunc {

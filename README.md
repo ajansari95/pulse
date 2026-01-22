@@ -79,6 +79,7 @@ settings:
   coordinator_url: ""         # Coordinator URL (agent mode)
   regions_required: 2         # Minimum regions to alert
   region_alerts: false        # Coordinator sends per-region alerts
+  report_stale_after: "5m"    # Ignore stale region reports
 ```
 
 ### Maintenance Windows
@@ -220,6 +221,7 @@ Override settings via env:
 - `COORDINATOR_URL`
 - `REGIONS_REQUIRED`
 - `REGION_ALERTS`
+- `REPORT_STALE_AFTER`
 
 ## Prometheus Metrics
 

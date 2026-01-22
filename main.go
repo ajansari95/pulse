@@ -2239,7 +2239,6 @@ func main() {
 	mux.HandleFunc("/health", monitor.HealthHandler())
 	mux.HandleFunc("/status", monitor.HealthHandler())
 	mux.HandleFunc("/reload", monitor.reloadHandler("api"))
-	mux.HandleFunc("/reload", monitor.reloadHandler("api"))
 	mux.HandleFunc("/report", monitor.RegionReportHandler())
 	if metricsPort == "" || metricsPort == port {
 		mux.HandleFunc("/metrics", monitor.MetricsHandler())

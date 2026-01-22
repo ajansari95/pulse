@@ -109,13 +109,66 @@ async function fetchData() {
     }
 }
 
+function sanitizeUrl(value) {
+    if (!value) return '';
+    try {
+        const url = new URL(value);
+        if (url.protocol === 'http:' || url.protocol === 'https:') {
+            return url.href;
+        }
+    } catch (error) {
+        return '';
+    }
+    return '';
+}
+
+function createStatCard(labelText, valueText, valueColor) {
+    const card = document.createElement('div');
+    card.className = 'stat-card';
+
+    const label = document.createElement('div');
+    label.className = 'stat-label';
+    label.textContent = labelText;
+
+    const value = document.createElement('div');
+    value.className = 'stat-value';
+    value.textContent = valueText;
+    if (valueColor) {
+        value.style.color = valueColor;
+    }
+
+    card.append(label, value);
+    return card;
+}
+
+function createMetricRow(labelText, valueText) {
+    const row = document.createElement('div');
+    row.className = 'metric-row';
+
+    const label = document.createElement('span');
+    label.className = 'metric-label';
+    label.textContent = labelText;
+
+    const value = document.createElement('span');
+    value.textContent = valueText;
+
+    row.append(label, value);
+    return row;
+}
+
 function updateSummary(summary) {
     const container = document.getElementById('endpoints-list');
     const summaryStats = document.getElementById('summary-stats');
     const endpoints = summary && summary.endpoints ? summary.endpoints : [];
-    
+
+    container.replaceChildren();
+    summaryStats.replaceChildren();
+
     if (endpoints.length === 0) {
-        container.innerHTML = '<div class="empty-state">No endpoints configured.</div>';
+        const emptyState = document.createElement('div');
+        emptyState.className = 'empty-state';
+        emptyState.textContent = 'No endpoints configured.';
+        container.append(emptyState);
         return;
     }
 
@@ -124,58 +177,77 @@ function updateSummary(summary) {
     const down = total - up;
     const avgLatency = Math.round(endpoints.reduce((acc, e) => acc + e.response_time_ms, 0) / (total || 1));
 
-    summaryStats.innerHTML = `
-        <div class="stat-card">
-            <div class="stat-label">System Status</div>
-            <div class="stat-value" style="color: ${down > 0 ? 'var(--error-color)' : 'var(--success-color)'}">
-                ${down > 0 ? 'DEGRADED' : 'OPERATIONAL'}
-            </div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Monitors</div>
-            <div class="stat-value">${total} <span style="font-size: 1rem; color: var(--text-secondary)">(${up} UP)</span></div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Global Avg Latency</div>
-            <div class="stat-value">${avgLatency}ms</div>
-        </div>
-    `;
+    summaryStats.append(
+        createStatCard('System Status', down > 0 ? 'DEGRADED' : 'OPERATIONAL', down > 0 ? 'var(--error-color)' : 'var(--success-color)')
+    );
 
-    container.innerHTML = endpoints.map(ep => {
-        let statusClass = ep.up ? 'status-ok' : 'status-down';
-        let statusText = ep.up ? 'UP' : 'DOWN';
-        
+    const monitorsCard = document.createElement('div');
+    monitorsCard.className = 'stat-card';
+    const monitorsLabel = document.createElement('div');
+    monitorsLabel.className = 'stat-label';
+    monitorsLabel.textContent = 'Monitors';
+    const monitorsValue = document.createElement('div');
+    monitorsValue.className = 'stat-value';
+    monitorsValue.textContent = `${total} `;
+    const monitorsSpan = document.createElement('span');
+    monitorsSpan.style.fontSize = '1rem';
+    monitorsSpan.style.color = 'var(--text-secondary)';
+    monitorsSpan.textContent = `(${up} UP)`;
+    monitorsValue.append(monitorsSpan);
+    monitorsCard.append(monitorsLabel, monitorsValue);
+    summaryStats.append(monitorsCard);
+
+    summaryStats.append(createStatCard('Global Avg Latency', `${avgLatency}ms`));
+
+    endpoints.forEach(ep => {
+        const statusClass = ep.up ? 'status-ok' : 'status-down';
+        const statusText = ep.up ? 'UP' : 'DOWN';
         const lastCheck = ep.last_check ? new Date(ep.last_check).toLocaleTimeString() : 'Never';
-        
-        return `
-        <div class="endpoint-card">
-            <div class="endpoint-header">
-                <div class="endpoint-name">
-                    <span class="status-indicator ${statusClass}"></span>
-                    ${ep.name}
-                </div>
-                <div style="font-family: var(--font-mono); font-weight: bold; color: ${ep.up ? 'var(--success-color)' : 'var(--error-color)'}">
-                    ${statusText}
-                </div>
-            </div>
-            <a href="${ep.display_url || '#'}" target="_blank" class="endpoint-url">${ep.display_url || ''}</a>
-            <div class="endpoint-metrics">
-                <div class="metric-row">
-                    <span class="metric-label">Latency</span>
-                    <span>${ep.response_time_ms}ms</span>
-                </div>
-                <div class="metric-row">
-                    <span class="metric-label">Uptime</span>
-                    <span>${(ep.uptime_percent || 0).toFixed(2)}%</span>
-                </div>
-                <div class="metric-row">
-                    <span class="metric-label">Last Check</span>
-                    <span>${lastCheck}</span>
-                </div>
-            </div>
-        </div>
-        `;
-    }).join('');
+
+        const card = document.createElement('div');
+        card.className = 'endpoint-card';
+
+        const header = document.createElement('div');
+        header.className = 'endpoint-header';
+
+        const name = document.createElement('div');
+        name.className = 'endpoint-name';
+        const indicator = document.createElement('span');
+        indicator.className = `status-indicator ${statusClass}`;
+        const nameText = document.createElement('span');
+        nameText.textContent = ep.name;
+        name.append(indicator, nameText);
+
+        const statusValue = document.createElement('div');
+        statusValue.style.fontFamily = 'var(--font-mono)';
+        statusValue.style.fontWeight = 'bold';
+        statusValue.style.color = ep.up ? 'var(--success-color)' : 'var(--error-color)';
+        statusValue.textContent = statusText;
+
+        header.append(name, statusValue);
+
+        const urlLink = document.createElement('a');
+        urlLink.className = 'endpoint-url';
+        const safeUrl = sanitizeUrl(ep.display_url);
+        urlLink.href = safeUrl || '#';
+        urlLink.textContent = ep.display_url || '';
+        urlLink.target = '_blank';
+        urlLink.rel = 'noopener noreferrer';
+        if (!safeUrl) {
+            urlLink.addEventListener('click', (event) => event.preventDefault());
+        }
+
+        const metrics = document.createElement('div');
+        metrics.className = 'endpoint-metrics';
+        metrics.append(
+            createMetricRow('Latency', `${ep.response_time_ms}ms`),
+            createMetricRow('Uptime', `${(ep.uptime_percent || 0).toFixed(2)}%`),
+            createMetricRow('Last Check', lastCheck)
+        );
+
+        card.append(header, urlLink, metrics);
+        container.append(card);
+    });
 }
 
 function updateHistory(data) {
@@ -228,29 +300,43 @@ function updateHistory(data) {
     }
 
     const incidentContainer = document.getElementById('incident-timeline');
+    incidentContainer.replaceChildren();
     if (data.incidents && data.incidents.length > 0) {
         const sortedIncidents = data.incidents.sort((a, b) => new Date(b.start) - new Date(a.start));
-        
-        incidentContainer.innerHTML = sortedIncidents.map(inc => {
+
+        sortedIncidents.forEach(inc => {
             const start = new Date(inc.start).toLocaleString();
             const end = inc.end ? new Date(inc.end).toLocaleString() : 'Ongoing';
             const isDown = !inc.end;
             const statusClass = isDown ? 'incident-down' : 'incident-issue';
             const statusText = isDown ? 'ACTIVE OUTAGE' : 'RESOLVED';
-            
-            return `
-            <div class="timeline-item ${statusClass}">
-                <div class="timeline-date">${start} - ${end}</div>
-                <div class="timeline-title">${inc.endpoint}</div>
-                <div class="timeline-desc">
-                    Status: <strong>${statusText}</strong>. 
-                    ${inc.error || 'Service disruption detected.'}
-                </div>
-            </div>
-            `;
-        }).join('');
+
+            const item = document.createElement('div');
+            item.className = `timeline-item ${statusClass}`;
+
+            const date = document.createElement('div');
+            date.className = 'timeline-date';
+            date.textContent = `${start} - ${end}`;
+
+            const title = document.createElement('div');
+            title.className = 'timeline-title';
+            title.textContent = inc.endpoint;
+
+            const desc = document.createElement('div');
+            desc.className = 'timeline-desc';
+            const statusStrong = document.createElement('strong');
+            statusStrong.textContent = statusText;
+            desc.append('Status: ', statusStrong, '. ');
+            desc.append(inc.error || 'Service disruption detected.');
+
+            item.append(date, title, desc);
+            incidentContainer.append(item);
+        });
     } else {
-        incidentContainer.innerHTML = '<div class="empty-state">NO ACTIVE INCIDENTS RECORDED</div>';
+        const emptyState = document.createElement('div');
+        emptyState.className = 'empty-state';
+        emptyState.textContent = 'NO ACTIVE INCIDENTS RECORDED';
+        incidentContainer.append(emptyState);
     }
 }
 

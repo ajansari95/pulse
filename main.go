@@ -966,6 +966,13 @@ type DashboardHistory struct {
 	Incidents   []IncidentEvent           `json:"incidents"`
 }
 
+func responseTimeMs(status *EndpointStatus) int64 {
+	if status == nil {
+		return 0
+	}
+	return status.ResponseTime.Milliseconds()
+}
+
 func (m *Monitor) DashboardSummaryHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m.mu.RLock()
@@ -987,13 +994,19 @@ func (m *Monitor) DashboardSummaryHandler() http.HandlerFunc {
 				avgResponse = (metrics.TotalResponseTime / time.Duration(metrics.ResponseSamples)).Milliseconds()
 			}
 			longest := metrics.LongestDowntime.Milliseconds()
+			lastCheck := time.Time{}
+			lastError := ""
+			if status != nil {
+				lastCheck = status.LastCheck
+				lastError = status.LastError
+			}
 			reports = append(reports, EndpointReport{
 				Name:              ep.Name,
 				DisplayURL:        m.getDisplayURL(ep),
 				Up:                status != nil && status.IsUp,
-				ResponseTimeMs:    status.ResponseTime.Milliseconds(),
-				LastCheck:         status.LastCheck,
-				LastError:         status.LastError,
+				ResponseTimeMs:    responseTimeMs(status),
+				LastCheck:         lastCheck,
+				LastError:         lastError,
 				UptimePercent:     uptime,
 				AvgResponseTimeMs: avgResponse,
 				Incidents:         metrics.Incidents,

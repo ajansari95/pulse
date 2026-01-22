@@ -12,6 +12,7 @@ Lightweight endpoint monitoring with Telegram alerts. Single binary, zero depend
 - **Per-endpoint config** - Custom timeout, headers per endpoint
 - **Environment variables** - Use `${VAR}` syntax in config
 - **Telegram alerts** - Instant down/up/slow notifications
+- **Summary reports** - Daily/weekly uptime summaries
 - **Single binary** - No runtime dependencies
 
 ## Install
@@ -58,6 +59,8 @@ settings:
   slow_threshold: "5s"       # Alert if response exceeds this
   timeout: "10s"             # Default request timeout
   port: "8080"               # Health endpoint port
+  daily_summary: "09:00"     # Daily summary time (local)
+  weekly_summary: "monday 09:00" # Weekly summary schedule (local)
 ```
 
 ### HTTP Endpoints

@@ -125,3 +125,13 @@ func TestParseAlertDetails(t *testing.T) {
 		t.Fatalf("expected summary kind, got %s", summary.Kind)
 	}
 }
+
+func TestDaysUntilExpiry(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if days := daysUntilExpiry(now, now.Add(48*time.Hour)); days != 2 {
+		t.Fatalf("expected 2 days, got %d", days)
+	}
+	if days := daysUntilExpiry(now, now.Add(-24*time.Hour)); days != -1 {
+		t.Fatalf("expected -1 days, got %d", days)
+	}
+}

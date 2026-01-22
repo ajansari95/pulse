@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -64,7 +66,12 @@ type Endpoint struct {
 	Name       string `yaml:"name" json:"name"`
 	URL        string `yaml:"url" json:"url"`
 	DisplayURL string `yaml:"display_url,omitempty" json:"display_url,omitempty"`
-	Type       string `yaml:"type" json:"type"` // http, jsonrpc, tendermint, grpc, port, tcp, websocket
+	Type       string `yaml:"type" json:"type"` // http, jsonrpc, tendermint, grpc, port, tcp, websocket, ssl
+
+	// SSL options
+	WarnDays     int    `yaml:"warn_days,omitempty" json:"warn_days,omitempty"`
+	CriticalDays int    `yaml:"critical_days,omitempty" json:"critical_days,omitempty"`
+	CACertFile   string `yaml:"ca_cert_file,omitempty" json:"ca_cert_file,omitempty"`
 
 	// HTTP options
 	Method      string            `yaml:"method,omitempty" json:"method,omitempty"`             // GET, POST, PUT, DELETE, HEAD, OPTIONS
@@ -150,6 +157,8 @@ type Monitor struct {
 	historyLimit     int
 	totalChecks      map[string]int
 	totalFailures    map[string]int
+	sslExpiry        map[string]time.Time
+	sslLastWarn      map[string]time.Time
 	alertClient      *http.Client
 	mu               sync.RWMutex
 }
@@ -225,6 +234,8 @@ func NewMonitor(config Config) *Monitor {
 		historyLimit:     500,
 		totalChecks:      make(map[string]int),
 		totalFailures:    make(map[string]int),
+		sslExpiry:        make(map[string]time.Time),
+		sslLastWarn:      make(map[string]time.Time),
 		alertClient:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -564,6 +575,107 @@ func (m *Monitor) CheckWebSocket(ctx context.Context, ep Endpoint) (bool, string
 	return true, "", elapsed
 }
 
+func daysUntilExpiry(now time.Time, expiry time.Time) int {
+	return int(expiry.Sub(now).Hours() / 24)
+}
+
+func (m *Monitor) CheckSSL(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
+	start := time.Now()
+
+	urlValue := strings.TrimSpace(ep.URL)
+	if urlValue == "" {
+		return false, "missing url", 0
+	}
+	if !strings.Contains(urlValue, "://") {
+		urlValue = "https://" + urlValue
+	}
+	parsed, err := url.Parse(urlValue)
+	if err != nil {
+		return false, fmt.Sprintf("invalid url: %v", err), 0
+	}
+	host := parsed.Host
+	if host == "" {
+		host = parsed.Path
+	}
+	if host == "" {
+		return false, "missing host", 0
+	}
+
+	hostname := host
+	if strings.Contains(host, ":") {
+		if splitHost, _, err := net.SplitHostPort(host); err == nil {
+			hostname = splitHost
+		}
+	} else {
+		host = host + ":443"
+	}
+
+	rootCAs, _ := x509.SystemCertPool()
+	if rootCAs == nil {
+		rootCAs = x509.NewCertPool()
+	}
+	if ep.CACertFile != "" {
+		pemData, err := os.ReadFile(ep.CACertFile)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read CA cert: %v", err), 0
+		}
+		if !rootCAs.AppendCertsFromPEM(pemData) {
+			return false, "invalid CA cert bundle", 0
+		}
+	}
+
+	tlsConfig := &tls.Config{RootCAs: rootCAs}
+	if net.ParseIP(hostname) == nil {
+		tlsConfig.ServerName = hostname
+	}
+
+	timeout := m.defaultTimeout
+	if ep.Timeout != "" {
+		if t, err := time.ParseDuration(ep.Timeout); err == nil {
+			timeout = t
+		}
+	}
+
+	conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", host)
+	elapsed := time.Since(start)
+	if err != nil {
+		return false, fmt.Sprintf("dial failed: %v", err), elapsed
+	}
+	defer conn.Close()
+
+	tlsConn := tls.Client(conn, tlsConfig)
+	defer tlsConn.Close()
+	_ = tlsConn.SetDeadline(time.Now().Add(timeout))
+	if err := tlsConn.Handshake(); err != nil {
+		return false, fmt.Sprintf("tls handshake failed: %v", err), elapsed
+	}
+	state := tlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return false, "no peer certificates", elapsed
+	}
+
+	expiry := state.PeerCertificates[0].NotAfter
+	now := time.Now()
+	daysLeft := daysUntilExpiry(now, expiry)
+
+	m.mu.Lock()
+	m.sslExpiry[ep.Name] = expiry
+	m.mu.Unlock()
+
+	criticalDays := ep.CriticalDays
+	if criticalDays == 0 {
+		criticalDays = 7
+	}
+
+	if expiry.Before(now) {
+		return false, fmt.Sprintf("certificate expired %d days ago", -daysLeft), elapsed
+	}
+	if daysLeft <= criticalDays {
+		return false, fmt.Sprintf("certificate expires in %d days", daysLeft), elapsed
+	}
+	return true, "", elapsed
+}
+
 func (m *Monitor) CheckEndpoint(ctx context.Context, ep Endpoint) (bool, string, time.Duration) {
 	switch strings.ToLower(ep.Type) {
 	case "http", "https", "":
@@ -578,6 +690,8 @@ func (m *Monitor) CheckEndpoint(ctx context.Context, ep Endpoint) (bool, string,
 		return m.CheckPort(ctx, ep)
 	case "websocket", "ws", "wss":
 		return m.CheckWebSocket(ctx, ep)
+	case "ssl":
+		return m.CheckSSL(ctx, ep)
 	default:
 		// Default to HTTP for any URL
 		return m.CheckHTTP(ctx, ep)
@@ -770,6 +884,12 @@ func (m *Monitor) ensureMetrics(ep Endpoint) {
 	}
 	if _, ok := m.totalFailures[ep.Name]; !ok {
 		m.totalFailures[ep.Name] = 0
+	}
+	if _, ok := m.sslExpiry[ep.Name]; !ok {
+		m.sslExpiry[ep.Name] = time.Time{}
+	}
+	if _, ok := m.sslLastWarn[ep.Name]; !ok {
+		m.sslLastWarn[ep.Name] = time.Time{}
 	}
 }
 
@@ -1306,7 +1426,29 @@ func (m *Monitor) checkAll(ctx context.Context) {
 			if !isUp {
 				m.totalFailures[ep.Name]++
 			}
-
+			sslWarnMsg := ""
+			if strings.EqualFold(ep.Type, "ssl") && isUp {
+				expiry := m.sslExpiry[ep.Name]
+				if !expiry.IsZero() {
+					warnDays := ep.WarnDays
+					if warnDays == 0 {
+						warnDays = 30
+					}
+					criticalDays := ep.CriticalDays
+					if criticalDays == 0 {
+						criticalDays = 7
+					}
+					daysLeft := daysUntilExpiry(now, expiry)
+					if daysLeft > criticalDays && daysLeft <= warnDays {
+						lastWarn := m.sslLastWarn[ep.Name]
+						if lastWarn.IsZero() || now.Sub(lastWarn) >= 24*time.Hour {
+							m.sslLastWarn[ep.Name] = now
+							sslWarnMsg = fmt.Sprintf("⚠️ <b>%s</b> SSL certificate expires in %d days\n\nEndpoint: <code>%s</code>\nExpiry: %s",
+								ep.Name, daysLeft, displayURL, expiry.Format("2006-01-02"))
+						}
+					}
+				}
+			}
 			if isUp {
 				status.LastError = ""
 				status.ConsecFailures = 0
@@ -1335,12 +1477,18 @@ func (m *Monitor) checkAll(ctx context.Context) {
 					}
 					m.SendAlert(fmt.Sprintf("✅ <b>%s</b> is UP\n\nEndpoint: <code>%s</code>\nResponse: %v%s",
 						ep.Name, displayURL, responseTime.Round(time.Millisecond), downMsg))
+					if sslWarnMsg != "" {
+						m.SendAlert(sslWarnMsg)
+					}
 				} else {
 					status.Consecutive++
 					m.mu.Unlock()
 					if sendSlowAlert {
 						m.SendAlert(fmt.Sprintf("⚠️ <b>%s</b> is SLOW\n\nEndpoint: <code>%s</code>\nResponse: %v (threshold: %v)",
 							ep.Name, displayURL, responseTime.Round(time.Millisecond), m.slowThreshold))
+					}
+					if sslWarnMsg != "" {
+						m.SendAlert(sslWarnMsg)
 					}
 				}
 				log.Printf("✓ %s UP (%v)", ep.Name, responseTime.Round(time.Millisecond))

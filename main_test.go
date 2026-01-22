@@ -135,3 +135,24 @@ func TestDaysUntilExpiry(t *testing.T) {
 		t.Fatalf("expected -1 days, got %d", days)
 	}
 }
+
+func TestParseMaintenanceSchedule(t *testing.T) {
+	weekday, startHour, startMinute, endHour, endMinute, ok := parseMaintenanceSchedule("sunday 02:00-04:00")
+	if !ok {
+		t.Fatalf("expected maintenance schedule to parse")
+	}
+	if weekday != time.Sunday || startHour != 2 || startMinute != 0 || endHour != 4 || endMinute != 0 {
+		t.Fatalf("unexpected maintenance schedule values")
+	}
+}
+
+func TestIsWithinWeeklyWindow(t *testing.T) {
+	loc := time.UTC
+	now := time.Date(2026, 1, 18, 3, 0, 0, 0, loc) // Sunday
+	if !isWithinWeeklyWindow(now, time.Sunday, 2, 0, 4, 0) {
+		t.Fatalf("expected within maintenance window")
+	}
+	if isWithinWeeklyWindow(now, time.Sunday, 4, 0, 5, 0) {
+		t.Fatalf("expected outside maintenance window")
+	}
+}

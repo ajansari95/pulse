@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +105,52 @@ func TestMetricsHandler(t *testing.T) {
 	}
 	if !strings.Contains(body, "pulse_endpoint_total_checks{name=\"api\\\"prod\"} 3") {
 		t.Fatalf("expected checks metric, got %s", body)
+	}
+}
+
+func TestMetricsHandlerLatency(t *testing.T) {
+	config := Config{Endpoints: []Endpoint{{Name: "api", Latency: &LatencyConfig{}}}}
+	monitor := NewMonitor(config, "", 0)
+	monitor.statuses["api"] = &EndpointStatus{IsUp: true, LatencyP50: 120 * time.Millisecond, LatencyP95: 250 * time.Millisecond, LatencyP99: 400 * time.Millisecond}
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	recorder := httptest.NewRecorder()
+	monitor.MetricsHandler().ServeHTTP(recorder, req)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "pulse_endpoint_latency_seconds{name=\"api\",percentile=\"p95\"}") {
+		t.Fatalf("expected latency metric, got %s", body)
+	}
+}
+
+func TestPercentileDuration(t *testing.T) {
+	values := []time.Duration{400 * time.Millisecond, 100 * time.Millisecond, 300 * time.Millisecond, 200 * time.Millisecond}
+	sort.Slice(values, func(i, j int) bool {
+		return values[i] < values[j]
+	})
+
+	if got := percentileDuration(values, 0.50); got != 200*time.Millisecond {
+		t.Fatalf("expected p50 to be 200ms, got %v", got)
+	}
+	if got := percentileDuration(values, 0.95); got != 400*time.Millisecond {
+		t.Fatalf("expected p95 to be 400ms, got %v", got)
+	}
+	if got := percentileDuration(values, 0.99); got != 400*time.Millisecond {
+		t.Fatalf("expected p99 to be 400ms, got %v", got)
+	}
+}
+
+func TestUpdateLatencyWindowLocked(t *testing.T) {
+	config := Config{Endpoints: []Endpoint{{Name: "api", Latency: &LatencyConfig{Window: "2s"}}}}
+	monitor := NewMonitor(config, "", 0)
+	now := time.Date(2026, 1, 22, 10, 0, 0, 0, time.UTC)
+
+	monitor.updateLatencyWindowLocked("api", now, 120*time.Millisecond, 2*time.Second)
+	monitor.updateLatencyWindowLocked("api", now.Add(3*time.Second), 200*time.Millisecond, 2*time.Second)
+
+	samples := monitor.latencySamples["api"]
+	if len(samples) != 1 {
+		t.Fatalf("expected 1 sample after pruning, got %d", len(samples))
 	}
 }
 

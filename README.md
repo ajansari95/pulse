@@ -132,6 +132,20 @@ endpoints:
     match_regex: "v[0-9]+\\.[0-9]+"
 ```
 
+### Latency Percentiles
+
+```yaml
+endpoints:
+  - name: "API"
+    url: "https://api.example.com/health"
+    type: "http"
+    latency:
+      p50_threshold: "200ms"
+      p95_threshold: "500ms"
+      p99_threshold: "1s"
+      window: "5m"
+```
+
 ### Authentication
 
 ```yaml

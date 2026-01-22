@@ -14,6 +14,7 @@ Lightweight endpoint monitoring with Telegram alerts. Single binary, zero depend
 - **Telegram alerts** - Instant down/up/slow notifications
 - **Summary reports** - Daily/weekly uptime summaries
 - **Webhook notifications** - Slack, Discord, PagerDuty
+- **Web dashboard** - Status, charts, incident history
 - **Single binary** - No runtime dependencies
 
 ## Install
@@ -70,6 +71,7 @@ settings:
   port: "8080"               # Health endpoint port
   daily_summary: "09:00"     # Daily summary time (local)
   weekly_summary: "monday 09:00" # Weekly summary schedule (local)
+  public_dashboard: true      # Enable the web dashboard
 ```
 
 ### HTTP Endpoints
@@ -196,6 +198,15 @@ Override settings via env:
 - `TELEGRAM_CHAT_ID`
 - `CHECK_INTERVAL`
 - `PORT`
+- `PUBLIC_DASHBOARD`
+
+## Web Dashboard
+
+The dashboard is served at `/` and `/dashboard` when enabled. It provides real-time status, response-time charts, and incident history.
+
+API endpoints:
+- `/api/summary` for status and aggregate metrics
+- `/api/history` for response history and incidents
 
 ## Webhook Notifications
 

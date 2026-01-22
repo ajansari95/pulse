@@ -18,6 +18,7 @@ settings:
   port: "8080"
   daily_summary: "09:00"
   weekly_summary: "monday 09:00"
+  public_dashboard: true
 
 endpoints:
   # Simple HTTP health check

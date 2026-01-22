@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PULSE // SYSTEM STATUS</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="noise-overlay"></div>
+    <div class="scanline"></div>
+    
+    <header class="site-header">
+        <div class="logo-area">
+            <div class="pulse-icon"></div>
+            <h1>PULSE <span class="version">v1.0</span></h1>
+        </div>
+        <div class="controls">
+            <div class="last-updated" id="last-updated">SYNCING...</div>
+            <button id="theme-toggle" class="theme-btn" aria-label="Toggle Theme">
+                <span class="icon-sun">☼</span>
+                <span class="icon-moon">☾</span>
+            </button>
+        </div>
+    </header>
+
+    <main class="dashboard-grid">
+        <section class="panel summary-panel">
+            <header class="panel-header">
+                <h2>SYSTEM OVERVIEW</h2>
+                <div class="decor-line"></div>
+            </header>
+            <div class="summary-stats" id="summary-stats">
+                <div class="loading-text">INITIALIZING DATA STREAMS...</div>
+            </div>
+        </section>
+
+        <section class="panel endpoints-panel">
+            <header class="panel-header">
+                <h2>MONITORED ENDPOINTS</h2>
+                <div class="decor-line"></div>
+            </header>
+            <div class="endpoints-grid" id="endpoints-list">
+            </div>
+        </section>
+
+        <section class="panel charts-panel">
+            <header class="panel-header">
+                <h2>RESPONSE LATENCY</h2>
+                <div class="decor-line"></div>
+            </header>
+            <div class="chart-container">
+                <canvas id="responseChart"></canvas>
+            </div>
+        </section>
+
+        <section class="panel incidents-panel">
+            <header class="panel-header">
+                <h2>INCIDENT LOG</h2>
+                <div class="decor-line"></div>
+            </header>
+            <div class="timeline" id="incident-timeline">
+                <div class="empty-state">NO ACTIVE INCIDENTS RECORDED</div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="site-footer">
+        <p>SYSTEM STATUS DASHBOARD // OPERATIONAL</p>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1226,6 +1226,9 @@ type EndpointReport struct {
 	DisplayURL        string    `json:"display_url"`
 	Up                bool      `json:"up"`
 	ResponseTimeMs    int64     `json:"response_time_ms"`
+	LatencyP50Ms      int64     `json:"latency_p50_ms"`
+	LatencyP95Ms      int64     `json:"latency_p95_ms"`
+	LatencyP99Ms      int64     `json:"latency_p99_ms"`
 	LastCheck         time.Time `json:"last_check"`
 	LastError         string    `json:"last_error"`
 	UptimePercent     float64   `json:"uptime_percent"`
@@ -1376,15 +1379,24 @@ func (m *Monitor) DashboardSummaryHandler() http.HandlerFunc {
 			longest := metrics.LongestDowntime.Milliseconds()
 			lastCheck := time.Time{}
 			lastError := ""
+			latencyP50 := int64(0)
+			latencyP95 := int64(0)
+			latencyP99 := int64(0)
 			if status != nil {
 				lastCheck = status.LastCheck
 				lastError = status.LastError
+				latencyP50 = status.LatencyP50.Milliseconds()
+				latencyP95 = status.LatencyP95.Milliseconds()
+				latencyP99 = status.LatencyP99.Milliseconds()
 			}
 			reports = append(reports, EndpointReport{
 				Name:              ep.Name,
 				DisplayURL:        m.getDisplayURL(ep),
 				Up:                status != nil && status.IsUp,
 				ResponseTimeMs:    responseTimeMs(status),
+				LatencyP50Ms:      latencyP50,
+				LatencyP95Ms:      latencyP95,
+				LatencyP99Ms:      latencyP99,
 				LastCheck:         lastCheck,
 				LastError:         lastError,
 				UptimePercent:     uptime,
@@ -2385,8 +2397,17 @@ func (m *Monitor) HealthHandler() http.HandlerFunc {
 		allUp := true
 		response := make(map[string]interface{})
 		for name, status := range m.statuses {
+			latencyP50 := int64(0)
+			latencyP95 := int64(0)
+			latencyP99 := int64(0)
+			if status != nil {
+				latencyP50 = status.LatencyP50.Milliseconds()
+				latencyP95 = status.LatencyP95.Milliseconds()
+				latencyP99 = status.LatencyP99.Milliseconds()
+			}
 			response[name] = map[string]interface{}{
 				"up": status.IsUp, "response_time_ms": status.ResponseTime.Milliseconds(),
+				"latency_p50_ms": latencyP50, "latency_p95_ms": latencyP95, "latency_p99_ms": latencyP99,
 				"last_check": status.LastCheck, "last_error": status.LastError,
 			}
 			if !status.IsUp {

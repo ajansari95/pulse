@@ -321,6 +321,22 @@ curl http://localhost:8080/health
 
 Returns JSON with all endpoint statuses. Returns 503 if any endpoint is down.
 
+Sample response:
+
+```json
+{
+  "API": {
+    "up": true,
+    "response_time_ms": 120,
+    "latency_p50_ms": 110,
+    "latency_p95_ms": 240,
+    "latency_p99_ms": 300,
+    "last_check": "2026-01-22T10:00:00Z",
+    "last_error": ""
+  }
+}
+```
+
 ## Docker
 
 ```bash

@@ -2397,14 +2397,21 @@ func (m *Monitor) HealthHandler() http.HandlerFunc {
 		allUp := true
 		response := make(map[string]interface{})
 		for name, status := range m.statuses {
+			if status == nil {
+				response[name] = map[string]interface{}{
+					"up": false, "response_time_ms": int64(0),
+					"latency_p50_ms": int64(0), "latency_p95_ms": int64(0), "latency_p99_ms": int64(0),
+					"last_check": time.Time{}, "last_error": "",
+				}
+				allUp = false
+				continue
+			}
 			latencyP50 := int64(0)
 			latencyP95 := int64(0)
 			latencyP99 := int64(0)
-			if status != nil {
-				latencyP50 = status.LatencyP50.Milliseconds()
-				latencyP95 = status.LatencyP95.Milliseconds()
-				latencyP99 = status.LatencyP99.Milliseconds()
-			}
+			latencyP50 = status.LatencyP50.Milliseconds()
+			latencyP95 = status.LatencyP95.Milliseconds()
+			latencyP99 = status.LatencyP99.Milliseconds()
 			response[name] = map[string]interface{}{
 				"up": status.IsUp, "response_time_ms": status.ResponseTime.Milliseconds(),
 				"latency_p50_ms": latencyP50, "latency_p95_ms": latencyP95, "latency_p99_ms": latencyP99,

@@ -68,7 +68,7 @@ func TestNextWeeklyRun(t *testing.T) {
 }
 
 func TestWebhookSendersSkipWhenUnset(t *testing.T) {
-	monitor := NewMonitor(Config{})
+	monitor := NewMonitor(Config{}, "", 0)
 	if err := monitor.sendSlackAlert("test"); err != nil {
 		t.Fatalf("expected slack sender to skip, got %v", err)
 	}
@@ -89,7 +89,7 @@ func TestPrometheusLabelValue(t *testing.T) {
 
 func TestMetricsHandler(t *testing.T) {
 	config := Config{Endpoints: []Endpoint{{Name: "api\"prod"}}}
-	monitor := NewMonitor(config)
+	monitor := NewMonitor(config, "", 0)
 	monitor.statuses["api\"prod"] = &EndpointStatus{IsUp: true, ResponseTime: 150 * time.Millisecond}
 	monitor.totalChecks["api\"prod"] = 3
 	monitor.totalFailures["api\"prod"] = 1
@@ -162,7 +162,7 @@ func TestBuildRegionReport(t *testing.T) {
 	config.Settings.Region = "us-east-1"
 	config.Endpoints = []Endpoint{{Name: "api"}}
 
-	monitor := NewMonitor(config)
+	monitor := NewMonitor(config, "", 0)
 	monitor.statuses["api"] = &EndpointStatus{IsUp: true, ResponseTime: 50 * time.Millisecond}
 
 	report := monitor.BuildRegionReport()
@@ -181,7 +181,7 @@ func TestEvaluateAggregatesStaleReports(t *testing.T) {
 	config.Settings.ReportStaleAfter = "1m"
 	config.Endpoints = []Endpoint{{Name: "API"}}
 
-	monitor := NewMonitor(config)
+	monitor := NewMonitor(config, "", 0)
 	monitor.regionReports["API"] = map[string]RegionStatus{
 		"us": {Up: false},
 		"eu": {Up: false},
